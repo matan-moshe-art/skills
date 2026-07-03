@@ -1,0 +1,71 @@
+"""
+Minimal-but-complete MCP server over stdio.
+
+Demonstrates:
+- a plain tool (no Context needed)
+- a tool that asks the connected client's LLM to do work (sampling)
+- a tool that reports progress and logs while it runs (notifications)
+
+Run standalone for manual testing with the MCP Inspector:
+    uv run mcp dev stdio_server.py
+
+Or launch it from a client via StdioServerParameters — see stdio_client.py.
+"""
+
+import asyncio
+
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import SamplingMessage, TextContent
+
+mcp = FastMCP(name="Demo Stdio Server")
+
+
+@mcp.tool()
+def add(a: int, b: int) -> int:
+    """Add two numbers. Plain tool — no Context, no I/O, nothing async needed."""
+    return a + b
+
+
+@mcp.tool()
+async def summarize(text_to_summarize: str, ctx: Context) -> str:
+    """
+    Summarize text using the *client's* LLM via sampling.
+
+    This server never calls an LLM API directly — it asks the connected
+    client to run the completion. The client decides which model to use,
+    whether to allow the request at all, and who pays for it.
+    """
+    prompt = f"Please summarize the following text:\n{text_to_summarize}"
+
+    result = await ctx.session.create_message(
+        messages=[
+            SamplingMessage(role="user", content=TextContent(type="text", text=prompt))
+        ],
+        max_tokens=4000,
+        system_prompt="You are a helpful research assistant.",
+    )
+
+    if result.content.type == "text":
+        return result.content.text
+    raise ValueError(f"Sampling returned non-text content: {result.content.type}")
+
+
+@mcp.tool()
+async def process_items(items: list[str], ctx: Context) -> str:
+    """
+    Process a list of items, reporting progress and logging as it goes.
+
+    Progress/log calls are notifications: the client doesn't have to reply,
+    they just show up as live feedback while the tool runs. If the caller
+    didn't pass a progress_callback, report_progress() is a harmless no-op.
+    """
+    total = len(items)
+    for i, item in enumerate(items):
+        await ctx.info(f"Processing {item!r} ({i + 1}/{total})")
+        await ctx.report_progress(progress=i + 1, total=total, message=f"Done with {item!r}")
+        await asyncio.sleep(0)  # replace with real work
+    return f"Processed {total} items"
+
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")

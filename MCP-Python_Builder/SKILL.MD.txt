@@ -1,0 +1,153 @@
+---
+name: mcp-python-builder
+description: Write production-quality Python code for Model Context Protocol (MCP) clients and servers using the official `mcp` SDK — stdio and StreamableHTTP transports, FastMCP tools/resources/prompts, sampling (server-requested LLM calls run on the connected client), progress/logging notifications, and roots-based file access. Use whenever the user asks to build, extend, port, or debug an MCP server or client in Python; wants a tool that calls back into the connected LLM; needs progress/log streaming from a long-running tool; wants a server to request directory access from the client (roots); needs to move a local stdio server to a network-reachable StreamableHTTP deployment; or asks about MCP session state, resumability, or stateless scaling. Trigger even without the word "MCP" (e.g. mentions of FastMCP, ClientSession, StdioServerParameters, stdio_client).
+---
+
+# MCP Python Builder
+
+Writes MCP client/server code against the official `mcp` Python SDK (`pip install mcp` / `uv add mcp`). `assets/stdio_server.py` + `assets/stdio_client.py` is a working, tested example covering tools, sampling, and progress/logging notifications — start there and copy/adapt rather than writing transport wiring from scratch.
+
+## SDK version
+
+Target v1.x (`mcp>=1,<2`) — stable, what's actually in production. A v2 pre-release exists, reworking MCP around the upcoming 2026-07-28 spec (stateless request/response instead of the current stateful/bidirectional model; `FastMCP` becomes `MCPServer`). Sampling, roots, and server-initiated notifications as described below are v1.x patterns that depend on the current bidirectional session — don't blend them with v2 code. Only target v2 if the user explicitly asks, and flag it as pre-release.
+
+## Architecture, in short
+
+JSON-RPC over stdio or HTTP. **Requests** (`tools/call`, `sampling/createMessage`, `roots/list`) expect exactly one reply. **Notifications** (progress, logs) are fire-and-forget. The counterintuitive part: sampling and roots are requests the *server* sends to the *client* — the server asks the client to run an LLM call or reveal which directories it may touch. This only works if the client registers callbacks for them; otherwise those calls silently fail or hang (see Pitfalls). Every connection opens with an `initialize` handshake; `FastMCP.run()` and `ClientSession` as an `async with` context manager handle it for you.
+
+## The example (assets/)
+
+`stdio_server.py` / `stdio_client.py` is a matched, working pair — spawn-a-subprocess transport, one plain tool, one sampling tool, one tool with progress + logging. Run `uv run mcp dev stdio_server.py` to poke at it with the MCP Inspector, or run `stdio_client.py` directly (needs `ANTHROPIC_API_KEY` for the sampling call). Copy this pair as the starting point for any new server/client; adapt tool names and logic, keep the wiring.
+
+## Sampling: server asks the client's LLM to do work
+
+Server side — add a `Context` param, call `ctx.session.create_message(...)` (snake_case kwargs):
+
+```python
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import SamplingMessage, TextContent
+
+mcp = FastMCP("Demo")
+
+@mcp.tool()
+async def summarize(text_to_summarize: str, ctx: Context) -> str:
+    result = await ctx.session.create_message(
+        messages=[SamplingMessage(role="user", content=TextContent(
+            type="text", text=f"Please summarize:\n{text_to_summarize}"
+        ))],
+        max_tokens=4000,
+        system_prompt="You are a helpful research assistant.",
+    )
+    if result.content.type == "text":
+        return result.content.text
+    raise ValueError(f"Sampling returned non-text content: {result.content.type}")
+```
+
+Client side — register `sampling_callback` on `ClientSession`, or every sampling request auto-rejects:
+
+```python
+from anthropic import AsyncAnthropic
+from mcp.shared.context import RequestContext
+from mcp.types import CreateMessageRequestParams, CreateMessageResult, TextContent
+
+anthropic_client = AsyncAnthropic()
+MODEL = "claude-sonnet-4-6"  # the client picks and pays for the model, not the server
+
+async def sampling_callback(context: RequestContext, params: CreateMessageRequestParams) -> CreateMessageResult:
+    messages = [{"role": m.role, "content": m.content.text} for m in params.messages if m.content.type == "text"]
+    response = await anthropic_client.messages.create(
+        model=MODEL,
+        system=params.systemPrompt or "You are a helpful assistant.",
+        messages=messages,
+        max_tokens=params.maxTokens or 4000,
+    )
+    text = "".join(b.text for b in response.content if b.type == "text")
+    return CreateMessageResult(role="assistant", model=MODEL, content=TextContent(type="text", text=text))
+
+# ClientSession(read, write, sampling_callback=sampling_callback)
+```
+
+**Casing gotcha**: incoming `params` uses wire-format camelCase (`params.systemPrompt`, `params.maxTokens`) — the opposite convention from the server's snake_case `create_message(...)` kwargs. Mixing them up raises `AttributeError`.
+
+## Notifications: progress + logging
+
+Both are one-way; the client doesn't reply. **Both are coroutines — always `await` them**, or the message silently never arrives.
+
+```python
+@mcp.tool()
+async def process_items(items: list[str], ctx: Context) -> str:
+    total = len(items)
+    for i, item in enumerate(items):
+        await ctx.info(f"Processing {item!r} ({i + 1}/{total})")
+        await ctx.report_progress(progress=i + 1, total=total, message=f"Done with {item!r}")
+    return f"Processed {total} items"
+```
+
+Client opts into progress **per call** (not on the session):
+
+```python
+async def on_progress(progress: float, total: float | None, message: str | None) -> None:
+    print(f"[progress] {progress}/{total or '?'} {message or ''}")
+
+# await session.call_tool("process_items", arguments={...}, progress_callback=on_progress)
+```
+
+Logs need a `logging_callback` on `ClientSession` (or a `message_handler`). Without it, `ctx.info`/`ctx.warning`/etc. calls run fine on the server but the messages go nowhere on the client — no error either side.
+
+## Roots: server asks which directories it may touch
+
+```python
+@mcp.tool()
+async def analyze_project(ctx: Context) -> TextContent:
+    roots_result = await ctx.session.list_roots()
+    if not roots_result or not roots_result.roots:
+        return TextContent(type="text", text="No project roots available.")
+    return TextContent(type="text", text=f"Analyzing: {[r.uri for r in roots_result.roots]}")
+```
+
+**If the client doesn't pass `list_roots_callback` to `ClientSession`, this hangs forever** — no default timeout. Always implement it if the server might call `list_roots()`:
+
+```python
+import mcp.types as types
+from pathlib import Path
+
+async def list_roots_handler(context) -> types.ListRootsResult:
+    return types.ListRootsResult(roots=[
+        types.Root(uri=types.FileUrl(f"file://{Path.cwd().absolute()}"), name="Current Project")
+    ])
+
+# ClientSession(read, write, list_roots_callback=list_roots_handler)
+```
+
+Roots communicate *intended* scope from a cooperative client, not a security boundary — still validate paths server-side (no `..` traversal, no following symlinks out of scope) if handling untrusted input within a root.
+
+## Transports: stdio vs. StreamableHTTP
+
+**stdio** (client spawns the server as a subprocess, talks over stdin/stdout) — what the example uses. Use for same-machine / client-managed deployment (Claude Desktop launching a local tool). No auth surface, no session-state problem — one client per process by construction.
+
+**StreamableHTTP** — for a network-reachable server. Same tool code; only the transport call changes:
+
+```python
+mcp = FastMCP("Demo", host="127.0.0.1", port=8000)  # add stateless_http=True — see below
+# ...
+mcp.run(transport="streamable-http")   # instead of transport="stdio"
+```
+
+Client: `from mcp.client.streamable_http import streamablehttp_client` → `async with streamablehttp_client("http://host:port/mcp") as (read, write, get_session_id):` in place of `stdio_client(...)`.
+
+- **Stateful (default)**: server assigns a session ID (`Mcp-Session-Id` header), required for sampling/roots/resumability. Behind a load balancer without sticky sessions you'll see `400: No valid session ID provided` when a follow-up request lands on a different node.
+- **Stateless (`stateless_http=True`)**: no session, any node handles any request — simple horizontal scaling, but sampling/roots/resumability stop working (there's no persistent session to push a server-initiated request into). Don't suggest this for a server whose tools use sampling or roots.
+
+SSE is the legacy predecessor to StreamableHTTP — don't use it for new servers; `mcp.sse_app()` exists only for backward compatibility with old clients.
+
+## Pitfalls checklist
+
+1. `ctx.info/debug/warning/error/report_progress` are coroutines — missing `await` = silent no-op.
+2. `roots/list` hangs forever without a `list_roots_callback` on the client.
+3. Sampling: `params.systemPrompt`/`params.maxTokens` (client, camelCase) vs. `create_message(system_prompt=..., max_tokens=...)` (server, snake_case).
+4. Stateful StreamableHTTP behind a plain load balancer → intermittent session-ID errors; use sticky sessions or `stateless_http=True` (and drop sampling/roots if you do).
+5. `progress_callback` is per-`call_tool`, not per-session — easy to set it once and expect it to apply everywhere.
+
+## Verification
+
+`uv run mcp dev server.py` opens the MCP Inspector for manual tool calls before wiring a real client. For stdio, just run the client script — it spawns the server itself. For HTTP, start the server first, then run the client or point the Inspector's HTTP mode at `http://host:port/mcp`.
