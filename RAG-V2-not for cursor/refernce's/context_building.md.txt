@@ -1,0 +1,1269 @@
+from pathlib import Path
+
+contextbuilding_md = r"""# Context Building Reference
+
+This file defines the expected enterprise standard for building the final context block passed into an LLM after retrieval, fusion, and optional reranking.
+
+Context building is the final retrieval step.
+
+It must be:
+
+- token-budget-aware
+- metadata-preserving
+- deterministic
+- source-labeled
+- score-aware
+- permission-safe
+- traceable
+- suitable for enterprise RAG workflows
+
+The context builder should not perform retrieval.
+
+The context builder should not perform fusion.
+
+The context builder should not perform reranking.
+
+The context builder should not call embedding models.
+
+The context builder should not call LLMs.
+
+Its job is to take already-ranked retrieval results and turn them into a clean, bounded, auditable context payload.
+
+---
+
+## Purpose
+
+The context builder answers one question:
+
+    Which retrieved chunks should be included, in what format, without exceeding the context budget?
+
+A strong context builder prevents common RAG failures:
+
+- exceeding model context limits
+- losing source metadata
+- returning duplicate chunks
+- leaking private metadata
+- hiding retrieval scores
+- hiding score provenance
+- mixing synthetic contextual notes with original source text
+- silently dropping important chunks
+- passing unreadable raw objects to the LLM
+
+---
+
+## Core Enterprise Rule
+
+The final context block must be useful for the LLM and auditable for the developer.
+
+It must preserve enough information to answer:
+
+- which chunks were included
+- which chunks were skipped
+- why chunks were skipped
+- which document each chunk came from
+- which score or rank caused the chunk to be selected
+- whether the result came from keyword retrieval, embedding retrieval, fusion, or reranking
+- whether contextualized indexing was used
+- whether the final text is original source text or synthetic/contextualized text
+
+Do not silently exceed token budgets.
+
+Do not silently remove metadata.
+
+Do not expose secrets in the final context.
+
+---
+
+## Required Behavior
+
+A gold-standard context builder must:
+
+- accept ranked results
+- preserve result order
+- deduplicate by chunk_id
+- respect max_context_tokens
+- preserve metadata
+- include source labels
+- include chunk IDs when requested
+- include scores when requested
+- include score provenance when requested
+- include document names when available
+- include page numbers when available
+- include section headings when available
+- skip chunks that do not fit unless truncation is explicitly enabled
+- return warnings when chunks are skipped
+- return warnings when chunks are truncated
+- return empty context safely when no results exist
+- track included sources
+- track skipped chunk IDs
+- avoid exposing private metadata by default
+- return original chunk text when contextualized indexing was used unless explicitly configured otherwise
+
+---
+
+## Non-Responsibilities
+
+The context builder must not:
+
+- retrieve chunks
+- embed queries
+- embed documents
+- compute keyword scores
+- compute cosine similarity
+- fuse ranked lists
+- rerank candidates
+- call an LLM
+- call external APIs
+- modify stored chunks
+- change source metadata
+- apply access control as a replacement for retrieval filtering
+
+Access control should already be enforced before final context building.
+
+The context builder may still avoid displaying sensitive metadata in source headers.
+
+---
+
+## Data Models
+
+Python-style contracts:
+
+    from __future__ import annotations
+
+    from dataclasses import dataclass, field
+    from typing import Any
+
+
+    Metadata = dict[str, Any]
+
+
+    @dataclass(frozen=True)
+    class ContextSource:
+        chunk_id: str
+        document_id: str
+        document_name: str
+        token_count: int
+        metadata: Metadata
+        score_summary: dict[str, Any]
+
+
+    @dataclass(frozen=True)
+    class ContextBuildConfig:
+        max_context_tokens: int
+        include_scores: bool = True
+        include_metadata: bool = True
+        include_score_provenance: bool = True
+        include_chunk_ids: bool = True
+        include_page_numbers: bool = True
+        include_section_headings: bool = True
+        include_source_uri: bool = False
+        allow_truncation: bool = False
+        return_original_text_if_available: bool = True
+        separator: str = "\n\n---\n\n"
+
+
+    @dataclass(frozen=True)
+    class ContextBuildResult:
+        context: str
+        used_tokens: int
+        included_sources: list[ContextSource]
+        skipped_chunk_ids: list[str]
+        warnings: list[str]
+
+
+    @dataclass(frozen=True)
+    class RetrievalResponse:
+        query: str
+        context: str
+        results: list[Any]
+        result_count: int
+        used_context_tokens: int
+        included_sources: list[ContextSource]
+        skipped_chunk_ids: list[str]
+        warnings: list[str]
+        config_used: dict[str, Any] = field(default_factory=dict)
+
+---
+
+## Accepted Result Shape
+
+The context builder may receive any ranked result object as long as it exposes:
+
+- chunk_id
+- document_id
+- text
+- token_count
+- metadata
+
+Supported result types may include:
+
+- RetrievalResult
+- FusedRetrievalResult
+- RerankedResult
+
+Expected retrieval-style shape:
+
+    @dataclass(frozen=True)
+    class RetrievalResult:
+        chunk_id: str
+        document_id: str
+        text: str
+        token_count: int
+        metadata: dict[str, Any]
+        score: float
+        score_type: str
+        rank: int
+        retriever_name: str
+
+Expected fusion-style shape:
+
+    @dataclass(frozen=True)
+    class FusedRetrievalResult:
+        chunk_id: str
+        document_id: str
+        text: str
+        token_count: int
+        metadata: dict[str, Any]
+        fused_score: float
+        fused_rank: int
+        source_results: list[Any]
+        contributing_retrievers: list[str]
+
+Expected reranking-style shape:
+
+    @dataclass(frozen=True)
+    class RerankedResult:
+        chunk_id: str
+        document_id: str
+        text: str
+        token_count: int
+        metadata: dict[str, Any]
+        rerank_score: float
+        rerank_rank: int
+        previous_rank: int
+        score_provenance: dict[str, Any]
+
+---
+
+## Token Counting
+
+Use the same token counter used by the chunking system when possible.
+
+For lightweight examples, use a deterministic estimator.
+
+    import math
+
+
+    def estimate_token_count(text: str) -> int:
+        if not text:
+            return 0
+
+        return max(1, math.ceil(len(text) / 4))
+
+Rules:
+
+- Use one token counting method consistently.
+- Do not estimate when exact model limits are required.
+- Count source headers if strict budgets matter.
+- Count separators if strict budgets matter.
+- Never silently exceed max_context_tokens.
+
+Enterprise recommendation:
+
+- use an exact tokenizer when the target LLM has strict context limits
+- use the estimator only for examples, tests, or approximate budgeting
+
+---
+
+## Config Validation
+
+Validate context build configuration before formatting.
+
+    def validate_context_build_config(config: ContextBuildConfig) -> None:
+        if config.max_context_tokens <= 0:
+            raise ValueError("max_context_tokens must be greater than zero.")
+
+        if not isinstance(config.separator, str):
+            raise ValueError("separator must be a string.")
+
+        if not config.separator:
+            raise ValueError("separator cannot be empty.")
+
+Rules:
+
+- Reject invalid max_context_tokens.
+- Reject invalid separator.
+- Keep truncation explicit.
+- Do not assume unlimited context.
+
+---
+
+## Result Validation
+
+Validate each result before using it.
+
+    def validate_context_result_shape(result: Any) -> None:
+        required_attributes = [
+            "chunk_id",
+            "document_id",
+            "text",
+            "token_count",
+            "metadata",
+        ]
+
+        missing = [
+            attribute
+            for attribute in required_attributes
+            if not hasattr(result, attribute)
+        ]
+
+        if missing:
+            raise ValueError(f"Result is missing required attributes: {missing}")
+
+        if not result.chunk_id or not str(result.chunk_id).strip():
+            raise ValueError("Result chunk_id cannot be empty.")
+
+        if not result.document_id or not str(result.document_id).strip():
+            raise ValueError(f"Result document_id cannot be empty: {result.chunk_id}")
+
+        if result.token_count <= 0:
+            raise ValueError(f"Result token_count must be positive: {result.chunk_id}")
+
+        if result.metadata is None:
+            raise ValueError(f"Result metadata cannot be None: {result.chunk_id}")
+
+Rules:
+
+- Reject malformed result objects.
+- Reject missing chunk IDs.
+- Reject missing document IDs.
+- Reject invalid token counts.
+- Treat empty text as skippable or error depending on strictness.
+- Do not pass raw malformed results to the LLM.
+
+---
+
+## Result Text Selection
+
+When contextual retrieval preprocessing is enabled, retrieval may use contextualized text for indexing.
+
+The final context should usually return original chunk text.
+
+Recommended rule:
+
+- use metadata["original_text"] when available and return_original_text_if_available is true
+- otherwise use result.text
+
+    def select_text_for_final_context(
+        *,
+        result: Any,
+        config: ContextBuildConfig,
+    ) -> str:
+        metadata = result.metadata or {}
+
+        if config.return_original_text_if_available:
+            original_text = metadata.get("original_text")
+
+            if isinstance(original_text, str) and original_text.strip():
+                return original_text.strip()
+
+        if not result.text or not result.text.strip():
+            return ""
+
+        return result.text.strip()
+
+Rules:
+
+- Do not return synthetic contextual notes by default.
+- Do not discard the ability to inspect contextualized text.
+- Do not confuse indexed text with source evidence.
+- If synthetic context is included, label it clearly.
+
+---
+
+## Score Summary Helper
+
+Different result types store scores differently.
+
+Use a helper so context formatting does not become fragile.
+
+    def get_result_score_summary(result: Any) -> dict[str, Any]:
+        if hasattr(result, "rerank_score"):
+            return {
+                "score_type": "rerank_score",
+                "score": result.rerank_score,
+                "rank": result.rerank_rank,
+                "previous_rank": result.previous_rank,
+                "provenance": getattr(result, "score_provenance", {}),
+            }
+
+        if hasattr(result, "fused_score"):
+            return {
+                "score_type": "fused_score",
+                "score": result.fused_score,
+                "rank": result.fused_rank,
+                "contributing_retrievers": getattr(result, "contributing_retrievers", []),
+            }
+
+        if hasattr(result, "score"):
+            return {
+                "score_type": result.score_type,
+                "score": result.score,
+                "rank": result.rank,
+                "retriever_name": result.retriever_name,
+            }
+
+        return {}
+
+Rules:
+
+- Keep raw retriever scores separate from fused scores.
+- Keep fused scores separate from rerank scores.
+- Preserve provenance when available.
+- Do not label a fused score as cosine similarity.
+- Do not label a rerank score as factual confidence.
+
+---
+
+## Safe Metadata Display
+
+Metadata may contain sensitive information.
+
+The context builder should not expose all metadata by default.
+
+Potentially sensitive metadata:
+
+- user_id
+- organization_id
+- permissions
+- access tokens
+- internal file paths
+- private URLs
+- API keys
+- emails
+- customer identifiers
+- security labels
+- access scopes
+
+Recommended display-safe metadata fields:
+
+- document_name
+- page_number
+- section_heading
+- source_uri only when allowed
+- tags only when non-sensitive
+- chunk_id when requested
+
+    SAFE_DISPLAY_METADATA_KEYS = {
+        "document_name",
+        "page_number",
+        "section_heading",
+        "source_uri",
+        "source_url",
+        "tags",
+    }
+
+
+    def get_safe_display_metadata(
+        *,
+        metadata: dict[str, Any],
+        include_source_uri: bool = False,
+    ) -> dict[str, Any]:
+        safe_metadata: dict[str, Any] = {}
+
+        for key in SAFE_DISPLAY_METADATA_KEYS:
+            if key not in metadata:
+                continue
+
+            if key in {"source_uri", "source_url"} and not include_source_uri:
+                continue
+
+            safe_metadata[key] = metadata[key]
+
+        return safe_metadata
+
+Rules:
+
+- Use permission metadata for filtering before context building.
+- Do not display permission metadata by default.
+- Do not display user_id or organization_id by default.
+- Do not display secrets.
+- Do not expose internal paths unless approved.
+
+---
+
+## Source Header Formatting
+
+Function:
+
+    format_source_header()
+
+Purpose:
+
+Create a readable source label for each context block.
+
+    def format_source_header(
+        *,
+        result: Any,
+        config: ContextBuildConfig,
+    ) -> str:
+        metadata = result.metadata or {}
+
+        document_name = metadata.get("document_name", "unknown")
+
+        header_parts = [
+            f"Source: {document_name}",
+        ]
+
+        if config.include_chunk_ids:
+            header_parts.append(f"Chunk: {result.chunk_id}")
+
+        if config.include_page_numbers:
+            page_number = metadata.get("page_number")
+            if page_number is not None:
+                header_parts.append(f"Page: {page_number}")
+
+        if config.include_section_headings:
+            section_heading = metadata.get("section_heading")
+            if section_heading:
+                header_parts.append(f"Section: {section_heading}")
+
+        if config.include_source_uri:
+            source_uri = metadata.get("source_uri") or metadata.get("source_url")
+            if source_uri:
+                header_parts.append(f"URL: {source_uri}")
+
+        if config.include_scores:
+            score_summary = get_result_score_summary(result)
+
+            if score_summary:
+                score_type = score_summary.get("score_type")
+                score = score_summary.get("score")
+                rank = score_summary.get("rank")
+
+                if isinstance(score, int | float):
+                    header_parts.append(f"{score_type}: {score:.4f}")
+
+                if rank is not None:
+                    header_parts.append(f"Rank: {rank}")
+
+                if config.include_score_provenance:
+                    retrievers = score_summary.get("contributing_retrievers")
+                    if retrievers:
+                        header_parts.append(f"Retrievers: {', '.join(retrievers)}")
+
+        if config.include_metadata:
+            tags = metadata.get("tags")
+            if tags:
+                header_parts.append(f"Tags: {tags}")
+
+        return f"[{' | '.join(header_parts)}]"
+
+Rules:
+
+- Keep headers readable.
+- Include source information.
+- Include scores only when requested.
+- Include source URI only when approved.
+- Do not expose sensitive metadata.
+- Do not include secrets.
+
+---
+
+## Context Block Formatting
+
+Function:
+
+    format_context_block()
+
+Purpose:
+
+Format one retrieved result into a context block.
+
+    def format_context_block(
+        *,
+        result: Any,
+        config: ContextBuildConfig,
+    ) -> str:
+        selected_text = select_text_for_final_context(
+            result=result,
+            config=config,
+        )
+
+        if not selected_text:
+            raise ValueError(f"Result text cannot be empty: {result.chunk_id}")
+
+        header = format_source_header(
+            result=result,
+            config=config,
+        )
+
+        return f"{header}\n{selected_text}"
+
+Rules:
+
+- Include a source header.
+- Include selected final text.
+- Use original text when available and configured.
+- Do not include raw object dumps.
+- Do not include synthetic context unless explicitly configured.
+
+---
+
+## Optional Truncation
+
+Truncation should be disabled by default.
+
+Skipping is safer than truncating because truncation can remove important qualifiers.
+
+If truncation is enabled, it must be explicit and visible in warnings.
+
+    def truncate_text_by_estimated_tokens(
+        text: str,
+        *,
+        max_tokens: int,
+    ) -> str:
+        if max_tokens <= 0:
+            return ""
+
+        max_chars = max_tokens * 4
+
+        if len(text) <= max_chars:
+            return text
+
+        return text[:max_chars].rstrip() + "\n[TRUNCATED]"
+
+Rules:
+
+- Prefer skipping over truncating by default.
+- If truncating, mark text as truncated.
+- Do not truncate silently.
+- Do not truncate in a way that hides source labels.
+- Use exact tokenizer-based truncation in production when strict limits matter.
+
+---
+
+## Build Context Block
+
+Function:
+
+    build_context_block()
+
+Purpose:
+
+Build the final LLM context without exceeding the token budget.
+
+Inputs:
+
+- ranked results
+- context build config
+
+Output:
+
+- ContextBuildResult
+
+    def build_context_block(
+        results: list[Any],
+        *,
+        config: ContextBuildConfig,
+    ) -> ContextBuildResult:
+        validate_context_build_config(config)
+
+        if not results:
+            return ContextBuildResult(
+                context="",
+                used_tokens=0,
+                included_sources=[],
+                skipped_chunk_ids=[],
+                warnings=["No retrieval results were provided."],
+            )
+
+        blocks: list[str] = []
+        included_sources: list[ContextSource] = []
+        skipped_chunk_ids: list[str] = []
+        warnings: list[str] = []
+        seen_chunk_ids: set[str] = set()
+        used_tokens = 0
+
+        for result in results:
+            validate_context_result_shape(result)
+
+            if result.chunk_id in seen_chunk_ids:
+                skipped_chunk_ids.append(result.chunk_id)
+                warnings.append(f"Skipped duplicate chunk: {result.chunk_id}")
+                continue
+
+            selected_text = select_text_for_final_context(
+                result=result,
+                config=config,
+            )
+
+            if not selected_text:
+                skipped_chunk_ids.append(result.chunk_id)
+                warnings.append(f"Skipped empty result text: {result.chunk_id}")
+                continue
+
+            block = format_context_block(
+                result=result,
+                config=config,
+            )
+
+            block_tokens = estimate_token_count(block)
+
+            if used_tokens + block_tokens > config.max_context_tokens:
+                if not config.allow_truncation:
+                    skipped_chunk_ids.append(result.chunk_id)
+                    warnings.append(
+                        f"Skipped chunk {result.chunk_id} because it would exceed max_context_tokens."
+                    )
+                    continue
+
+                remaining_tokens = config.max_context_tokens - used_tokens
+
+                if remaining_tokens <= 0:
+                    skipped_chunk_ids.append(result.chunk_id)
+                    warnings.append(
+                        f"Skipped chunk {result.chunk_id}; no token budget remains."
+                    )
+                    continue
+
+                block = truncate_text_by_estimated_tokens(
+                    block,
+                    max_tokens=remaining_tokens,
+                )
+                block_tokens = estimate_token_count(block)
+
+                if block_tokens <= 0:
+                    skipped_chunk_ids.append(result.chunk_id)
+                    warnings.append(
+                        f"Skipped chunk {result.chunk_id}; truncation produced empty text."
+                    )
+                    continue
+
+                warnings.append(f"Truncated chunk {result.chunk_id} to fit token budget.")
+
+            blocks.append(block)
+            seen_chunk_ids.add(result.chunk_id)
+            used_tokens += block_tokens
+
+            metadata = result.metadata or {}
+
+            included_sources.append(
+                ContextSource(
+                    chunk_id=result.chunk_id,
+                    document_id=result.document_id,
+                    document_name=metadata.get("document_name", "unknown"),
+                    token_count=block_tokens,
+                    metadata=metadata,
+                    score_summary=get_result_score_summary(result),
+                )
+            )
+
+        return ContextBuildResult(
+            context=config.separator.join(blocks),
+            used_tokens=used_tokens,
+            included_sources=included_sources,
+            skipped_chunk_ids=skipped_chunk_ids,
+            warnings=warnings,
+        )
+
+---
+
+## Context Response Shape
+
+Recommended final response shape:
+
+    @dataclass(frozen=True)
+    class RetrievalResponse:
+        query: str
+        context: str
+        results: list[Any]
+        result_count: int
+        used_context_tokens: int
+        included_sources: list[ContextSource]
+        skipped_chunk_ids: list[str]
+        warnings: list[str]
+        config_used: dict[str, Any]
+
+Rules:
+
+- Return the context string.
+- Return structured sources.
+- Return skipped chunk IDs.
+- Return warnings.
+- Return config used for traceability.
+- Do not return only a plain string in enterprise systems.
+
+---
+
+## Example Usage
+
+    context_config = ContextBuildConfig(
+        max_context_tokens=3000,
+        include_scores=True,
+        include_metadata=True,
+        include_score_provenance=True,
+        include_chunk_ids=True,
+        include_page_numbers=True,
+        include_section_headings=True,
+        include_source_uri=False,
+        allow_truncation=False,
+        return_original_text_if_available=True,
+    )
+
+    context_result = build_context_block(
+        final_results,
+        config=context_config,
+    )
+
+    payload = {
+        "context": context_result.context,
+        "used_tokens": context_result.used_tokens,
+        "sources": context_result.included_sources,
+        "skipped_chunk_ids": context_result.skipped_chunk_ids,
+        "warnings": context_result.warnings,
+    }
+
+Expected behavior:
+
+- Results remain in ranked order.
+- Duplicate chunks are skipped.
+- Token budget is respected.
+- Sources are included.
+- Scores are visible when requested.
+- Warnings explain skipped chunks.
+- Original text is returned when contextualized indexing was used.
+
+---
+
+## Original vs Contextualized Text
+
+When contextual retrieval preprocessing is enabled:
+
+- contextualized text may be used for indexing
+- original chunk text should usually be used for final context output
+
+Correct:
+
+    Indexed text:
+    This chunk is from the Q2 report and discusses operating margin.
+
+    Operating margin increased by 4%.
+
+    Final context:
+    Operating margin increased by 4%.
+
+Rules:
+
+- Do not return synthetic contextual notes in final context unless requested.
+- Preserve access to original source text.
+- Preserve score provenance from contextualized retrieval.
+- Clearly label synthetic context if included.
+- Do not confuse contextualized indexing text with original evidence.
+
+---
+
+## Score and Provenance Rules
+
+The context builder should preserve score information when requested.
+
+For plain retrieval results, include:
+
+- score
+- score_type
+- rank
+- retriever_name
+
+For fused results, include:
+
+- fused_score
+- fused_rank
+- contributing_retrievers
+
+For reranked results, include:
+
+- rerank_score
+- rerank_rank
+- previous_rank
+- score_provenance
+
+Do not:
+
+- relabel fused scores as cosine similarity
+- relabel rerank scores as semantic similarity
+- treat any retrieval score as factual confidence
+- hide previous ranks when reranking was used
+
+---
+
+## Token Budget Rules
+
+The context builder must enforce max_context_tokens.
+
+Rules:
+
+- If a chunk fits, include it.
+- If a chunk does not fit and truncation is disabled, skip it and warn.
+- If truncation is enabled, truncate visibly and warn.
+- Do not exceed max_context_tokens silently.
+- Track used_tokens.
+- Track skipped_chunk_ids.
+- Return warnings.
+
+Enterprise recommendation:
+
+- keep truncation disabled by default
+- use exact model tokenizer in production
+- use estimated token counter only for examples or early prototypes
+
+---
+
+## Duplicate Handling
+
+Deduplicate by chunk_id.
+
+Rules:
+
+- If two retrievers return the same chunk, include it once.
+- Fusion should usually deduplicate before context building.
+- Context builder should still protect against duplicates.
+- Record skipped duplicate chunk IDs.
+- Preserve the highest-ranked instance based on input order.
+
+---
+
+## Security and Privacy Rules
+
+Never include sensitive metadata unless approved.
+
+Potentially sensitive metadata:
+
+- user_id
+- organization_id
+- permissions
+- access tokens
+- internal file paths
+- private URLs
+- API keys
+- emails
+- customer identifiers
+- security labels
+- hidden access scopes
+
+Rules:
+
+- Use permission metadata for filtering before context building.
+- Do not display permission metadata by default.
+- Do not expose secrets in source headers.
+- Do not include hidden system metadata in the LLM context unless required.
+- Keep context focused on retrieved document content.
+- Do not print API keys.
+- Do not log full sensitive context by default.
+
+---
+
+## Logging Rules
+
+Logs may include:
+
+- query ID
+- result count
+- used tokens
+- skipped chunk count
+- warning count
+- chunk IDs
+- document IDs
+- latency
+
+Logs should not include by default:
+
+- full context
+- full chunk text
+- sensitive metadata
+- API keys
+- access tokens
+- private URLs
+- customer secrets
+
+---
+
+## Error Handling
+
+Raise clear errors for:
+
+- invalid max_context_tokens
+- invalid separator
+- missing chunk_id
+- missing document_id
+- invalid token_count
+- unsupported result object shape
+- token counter failure
+
+Return warnings for:
+
+- no results
+- duplicate chunks
+- chunks skipped due to token limit
+- chunks truncated
+- empty result text skipped
+- original text missing when expected
+- contextualized text returned only when explicitly configured
+
+Do not fail silently.
+
+---
+
+## Tests
+
+A gold-standard context builder should include tests for the following cases.
+
+### Test 1 — Empty Results
+
+Input:
+
+    results = []
+
+Expected:
+
+- context is empty
+- used_tokens is 0
+- warning is returned
+
+### Test 2 — Invalid Token Budget
+
+Input:
+
+    max_context_tokens = 0
+
+Expected:
+
+    ValueError
+
+### Test 3 — Ranking Order Is Preserved
+
+Expected:
+
+- results appear in the same order they were passed in
+
+### Test 4 — Duplicate Chunks Are Skipped
+
+Input:
+
+- two results with the same chunk_id
+
+Expected:
+
+- chunk appears once
+- duplicate chunk_id appears in skipped_chunk_ids
+- warning is returned
+
+### Test 5 — Token Budget Is Respected
+
+Expected:
+
+- used_tokens is less than or equal to max_context_tokens
+
+### Test 6 — Oversized Chunks Are Skipped By Default
+
+Expected:
+
+- oversized chunk is skipped
+- warning is returned
+
+### Test 7 — Truncation Is Explicit
+
+Input:
+
+    allow_truncation = True
+
+Expected:
+
+- text is truncated
+- truncated text includes [TRUNCATED]
+- warning is returned
+
+### Test 8 — Metadata Is Preserved
+
+Expected:
+
+- document_name remains available
+- page_number remains available
+- section_heading remains available
+- metadata remains available in included_sources
+
+### Test 9 — Scores Are Included When Requested
+
+Input:
+
+    include_scores = True
+
+Expected:
+
+- source headers include score information
+
+### Test 10 — Scores Are Hidden When Not Requested
+
+Input:
+
+    include_scores = False
+
+Expected:
+
+- source headers do not include scores
+
+### Test 11 — Score Provenance Is Preserved
+
+Input:
+
+- fused or reranked results
+
+Expected:
+
+- provenance remains available in included_sources
+
+### Test 12 — No Secrets In Source Headers
+
+Input metadata contains:
+
+- API key
+- token
+- permissions
+- user_id
+
+Expected:
+
+- sensitive fields are not shown in source headers
+
+### Test 13 — Original Text Returned For Contextualized Indexing
+
+Input metadata contains:
+
+    original_text = "Original source text"
+
+Expected:
+
+- final context uses original_text
+- contextualized retrieval text is not shown by default
+
+### Test 14 — Empty Result Text Is Skipped
+
+Expected:
+
+- empty result text is skipped
+- warning is returned
+
+---
+
+## Bad vs Good
+
+Bad:
+
+    context = "\n".join([result.text for result in results])
+
+Why bad:
+
+- no source labels
+- no token budget
+- no score visibility
+- no metadata tracking
+- no skipped chunk tracking
+- no duplicate protection
+
+Bad:
+
+    def build_context(results):
+        return str(results)
+
+Why bad:
+
+- exposes raw object structure
+- unreadable for LLM
+- may leak internal metadata
+- no formatting policy
+- no token budget
+
+Bad:
+
+    context = "\n\n".join(result.metadata["original_text"] for result in results)
+
+Why bad:
+
+- assumes metadata exists
+- no validation
+- no source labels
+- no fallback
+- no warnings
+
+Good:
+
+    context_result = build_context_block(
+        final_results,
+        config=ContextBuildConfig(
+            max_context_tokens=3000,
+            include_scores=True,
+            include_metadata=True,
+            include_score_provenance=True,
+            return_original_text_if_available=True,
+        ),
+    )
+
+Why good:
+
+- token budget is enforced
+- metadata is preserved
+- sources are tracked
+- warnings are returned
+- original text is preferred when contextualized indexing was used
+
+---
+
+## Acceptance Criteria
+
+A context builder is enterprise-ready only if:
+
+- max_context_tokens is enforced
+- result order is preserved
+- duplicate chunks are skipped
+- metadata is preserved
+- source labels are included
+- scores are included when requested
+- score provenance is preserved when requested
+- original text is returned when contextualized indexing was used
+- synthetic contextual notes are not returned by default
+- skipped chunks are tracked
+- warnings are returned
+- sensitive metadata is not exposed by default
+- malformed results fail clearly
+- empty results return safely
+- tests cover empty, duplicate, oversized, truncated, and sensitive metadata cases
+
+---
+
+## Quality Checklist
+
+Before accepting context building as gold standard, verify:
+
+- context budget is enforced
+- tokenizer strategy is defined
+- duplicate chunk handling exists
+- skipped chunks are tracked
+- warnings are returned
+- metadata is preserved
+- source labels are readable
+- source labels avoid secrets
+- score summaries are supported
+- score provenance is supported
+- reranked results are supported
+- fused results are supported
+- plain retrieval results are supported
+- contextualized indexing can return original text
+- truncation is disabled by default
+- truncation is marked when enabled
+- unit tests are deterministic
+- no external API calls happen during context building
+"""
+
+Path("contextbuilding.md").write_text(
+    contextbuilding_md,
+    encoding="utf-8",
+)

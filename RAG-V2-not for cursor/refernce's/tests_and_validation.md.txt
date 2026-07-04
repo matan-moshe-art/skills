@@ -1,0 +1,978 @@
+from pathlib import Path
+
+tests_and_validation_md = r"""# Tests and Validation Reference
+
+This file defines the expected enterprise standard for testing and validating a modular RAG system.
+
+Testing must prove that the RAG pipeline is:
+
+- deterministic
+- metadata-preserving
+- permission-safe
+- token-budget-aware
+- retrieval-correct
+- source-traceable
+- provider-isolated
+- storage-safe
+- resilient to malformed input
+- safe for enterprise use
+
+A RAG system can look correct while silently failing.
+
+Common silent failures include:
+
+- chunks lose metadata
+- permission filters are bypassed
+- embeddings use the wrong model
+- vector dimensions do not match
+- contextualized text replaces original source text
+- keyword retrieval rewards repetition too strongly
+- hybrid fusion mixes incompatible raw scores
+- reranking hides provenance
+- context building exceeds token limits
+- storage returns stale chunks
+- deleted documents still appear in results
+
+Tests must catch these failures before production.
+
+---
+
+## Core Enterprise Rule
+
+Use deterministic unit tests for core logic.
+
+Do not require live API calls for normal tests.
+
+Unit tests must not depend on:
+
+- live Voyage API calls
+- live LLM context generation
+- live reranking APIs
+- external vector databases
+- network access
+- paid services
+- real customer data
+
+Use fake clients for:
+
+- embedding providers
+- context generators
+- rerankers
+- storage adapters
+
+Live provider tests should be separate optional integration tests.
+
+---
+
+## Test Categories
+
+A gold-standard enterprise RAG system should include tests for:
+
+1. Data model validation
+2. Document validation
+3. Chunking
+4. Token counting
+5. Keyword retrieval
+6. Embedding retrieval
+7. Contextual retrieval preprocessing
+8. Fusion and reranking
+9. Context building
+10. Storage
+11. Caching and stale artifact detection
+12. Security and permissions
+13. End-to-end retrieval orchestration
+14. Regression evaluation
+
+---
+
+## Validation Philosophy
+
+Validate before expensive or destructive operations.
+
+Validation should happen before:
+
+- chunking
+- embedding
+- contextualization
+- indexing
+- storage writes
+- retrieval
+- fusion
+- reranking
+- context building
+
+Do not wait for provider APIs or databases to fail when input can be rejected locally.
+
+---
+
+## Shared Validation Helpers
+
+Python-style validation helpers:
+
+    def validate_query(query: str) -> None:
+        if not query or not query.strip():
+            raise ValueError("query cannot be empty.")
+
+
+    def validate_top_k(top_k: int) -> None:
+        if top_k <= 0:
+            raise ValueError("top_k must be greater than zero.")
+
+
+    def validate_candidate_pool_size(
+        *,
+        candidate_pool_size: int,
+        top_k: int,
+    ) -> None:
+        if candidate_pool_size < top_k:
+            raise ValueError("candidate_pool_size must be greater than or equal to top_k.")
+
+
+    def validate_required_metadata(
+        *,
+        metadata: dict,
+        required_keys: list[str],
+    ) -> None:
+        missing = [key for key in required_keys if key not in metadata]
+
+        if missing:
+            raise ValueError(f"Missing required metadata keys: {missing}")
+
+
+    def validate_non_empty_string(
+        *,
+        value: str,
+        field_name: str,
+    ) -> None:
+        if not value or not value.strip():
+            raise ValueError(f"{field_name} cannot be empty.")
+
+---
+
+## Fake Embedding Client
+
+Use fake embeddings for deterministic tests.
+
+    class FakeEmbeddingClient:
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            if not texts:
+                raise ValueError("texts cannot be empty.")
+
+            return [self._embed(text) for text in texts]
+
+        def embed_query(self, query: str) -> list[float]:
+            if not query or not query.strip():
+                raise ValueError("query cannot be empty.")
+
+            return self._embed(query)
+
+        def _embed(self, text: str) -> list[float]:
+            normalized = text.lower()
+
+            return [
+                1.0 if "financial" in normalized else 0.0,
+                1.0 if "revenue" in normalized else 0.0,
+                1.0 if "password" in normalized else 0.0,
+                1.0 if "contract" in normalized else 0.0,
+            ]
+
+Rules:
+
+- fake embeddings should be simple
+- fake embeddings should be predictable
+- fake embeddings should not call external APIs
+- fake embeddings should make ranking assertions easy
+
+---
+
+## Fake Context Generator
+
+Use a fake context generator for contextual retrieval tests.
+
+    class FakeChunkContextGenerator:
+        def generate_context(
+            self,
+            *,
+            document,
+            chunk,
+            max_context_tokens: int,
+        ) -> str:
+            section = chunk.metadata.get("section_heading", "unknown section")
+            page = chunk.metadata.get("page_number")
+
+            page_part = f" on page {page}" if page is not None else ""
+
+            return (
+                f"This chunk is from {document.document_name}{page_part} "
+                f"and belongs to the {section} section."
+            )
+
+Rules:
+
+- contextual retrieval unit tests must not call live LLMs
+- generated test context must be deterministic
+- tests must verify original text is preserved
+- tests must verify contextualized text is stored separately
+
+---
+
+## Fake Reranker
+
+Use a fake reranker for deterministic reranking tests.
+
+    class FakeReranker:
+        def rerank(
+            self,
+            *,
+            query: str,
+            results: list,
+            top_k: int,
+        ) -> list[tuple[object, float]]:
+            if not query or not query.strip():
+                raise ValueError("query cannot be empty.")
+
+            if top_k <= 0:
+                raise ValueError("top_k must be greater than zero.")
+
+            query_terms = set(query.lower().split())
+            scored = []
+
+            for result in results:
+                text_terms = set(result.text.lower().split())
+                score = float(len(query_terms & text_terms))
+                scored.append((result, score))
+
+            scored.sort(key=lambda item: (-item[1], item[0].chunk_id))
+
+            return scored[:top_k]
+
+Rules:
+
+- reranking unit tests must be deterministic
+- fake reranker must preserve predictable ordering
+- tests must verify previous rank is preserved
+- tests must verify score provenance is preserved
+
+---
+
+## Data Model Tests
+
+Test that core data models are valid and stable.
+
+Required tests:
+
+1. Document ID cannot be empty.
+2. Chunk ID cannot be empty.
+3. Chunk document_id cannot be empty.
+4. Chunk text cannot be empty.
+5. Chunk token_count must be positive.
+6. Metadata defaults safely.
+7. Frozen dataclasses are not accidentally mutated when immutability is used.
+8. Retrieval results expose required fields.
+9. Fused results preserve source results.
+10. Reranked results preserve previous rank and provenance.
+
+Expected:
+
+- invalid objects fail clearly before indexing or retrieval
+
+---
+
+## Document Validation Tests
+
+Required tests:
+
+1. Empty document text raises ValueError.
+2. Empty document_id raises ValueError.
+3. Empty document_name raises ValueError.
+4. source_type is preserved.
+5. source_uri is preserved when provided.
+6. document metadata is preserved.
+7. permission metadata is preserved when present.
+8. organization metadata is preserved when present.
+9. text_hash changes when document text changes.
+
+Expected:
+
+- no empty documents are indexed
+- no document metadata is silently removed
+
+---
+
+## Chunking Tests
+
+Required tests:
+
+1. Empty text raises ValueError.
+2. Invalid max_tokens raises ValueError.
+3. Invalid overlap raises ValueError.
+4. overlap_tokens must be smaller than max_tokens.
+5. Paragraph chunks are non-empty.
+6. Chunk IDs are stable.
+7. Chunk IDs are unique.
+8. document_id is preserved.
+9. document_name is preserved in metadata.
+10. page_number is preserved when available.
+11. section_heading is preserved when available.
+12. permission metadata is preserved.
+13. token_count is positive.
+14. oversized paragraphs are handled intentionally.
+15. no chunk silently disappears.
+
+Expected:
+
+- chunking behavior is deterministic
+- metadata survives chunking
+- chunks are valid before indexing
+
+---
+
+## Token Counting Tests
+
+Required tests:
+
+1. Empty text returns zero tokens.
+2. Non-empty text returns at least one token.
+3. Same input returns same token count.
+4. Context builder does not exceed max_context_tokens.
+5. Oversized chunks are skipped by default.
+6. Truncation only happens when explicitly enabled.
+7. Truncated text is marked with a visible marker.
+8. Source headers are counted when strict budgeting matters.
+
+Expected:
+
+- token budgeting is predictable
+- context building never silently exceeds the configured limit
+
+---
+
+## Keyword Retrieval Tests
+
+Required tests:
+
+1. Empty query raises ValueError.
+2. Empty chunk list raises ValueError during index build.
+3. Empty chunk text raises ValueError.
+4. Stop words do not dominate ranking.
+5. Exact term match ranks higher than unrelated text.
+6. Repeated query terms do not explode score.
+7. Term frequency is normalized.
+8. IDF lowers the effect of common terms.
+9. No matches return an empty list.
+10. Stable tie-breaking uses chunk_id.
+11. Metadata is preserved in results.
+12. Filters are applied before returning results.
+13. Permission filters are not ignored.
+14. retriever_name is present.
+15. score_type is tf_idf.
+
+Example assertion direction:
+
+    def test_keyword_retrieval_ranks_exact_terms_higher():
+        index = build_keyword_index(chunks)
+
+        results = keyword_search(
+            query="financial revenue",
+            index=index,
+            top_k=2,
+        )
+
+        assert results
+        assert results[0].chunk_id == "financial-report:chunk-0"
+        assert results[0].score > 0
+        assert results[0].score_type == "tf_idf"
+        assert results[0].retriever_name == "keyword_tfidf"
+
+---
+
+## Embedding Retrieval Tests
+
+Required tests:
+
+1. Empty query raises ValueError.
+2. Empty chunk list raises ValueError.
+3. Empty chunk text raises ValueError.
+4. Empty embedding vector raises ValueError.
+5. NaN vector raises ValueError.
+6. Infinite vector raises ValueError.
+7. Non-numeric vector values raise ValueError.
+8. Dimension mismatch raises ValueError.
+9. Embedding count mismatch raises RuntimeError.
+10. Embedding model mismatch raises ValueError.
+11. Embedding provider mismatch raises ValueError.
+12. indexed_text_type mismatch raises ValueError.
+13. Semantic match ranks higher than unrelated text.
+14. Metadata is preserved.
+15. Permission filters are applied.
+16. Missing API key raises RuntimeError in the real provider wrapper.
+17. Unit tests use FakeEmbeddingClient.
+
+Example assertion direction:
+
+    def test_embedding_retrieval_uses_similarity_scores():
+        client = FakeEmbeddingClient()
+
+        embedded_chunks = embed_chunks(
+            chunks=chunks,
+            embedding_client=client,
+            embedding_model="fake-model",
+            provider_name="fake",
+        )
+
+        index = build_embedding_index(
+            embedded_chunks=embedded_chunks,
+            provider_name="fake",
+            embedding_model="fake-model",
+        )
+
+        results = embedding_search(
+            query="financial revenue",
+            index=index,
+            embedding_client=client,
+            top_k=2,
+        )
+
+        assert results
+        assert results[0].score_type == "cosine_similarity"
+        assert results[0].retriever_name.startswith("embedding")
+
+---
+
+## Contextual Retrieval Tests
+
+Required tests:
+
+1. Empty document text raises ValueError.
+2. Empty chunk text raises ValueError.
+3. Chunk/document mismatch raises ValueError.
+4. Missing context model raises ValueError when contextualization is enabled.
+5. Missing prompt version raises ValueError.
+6. Context is generated for each chunk.
+7. Context summary is non-empty.
+8. Original chunk text is preserved.
+9. contextualized_text includes context summary and original text.
+10. Contextualized text is stored separately.
+11. context_model is recorded.
+12. prompt_version is recorded.
+13. chunk_text_hash is recorded.
+14. Metadata is preserved.
+15. Permission metadata is preserved.
+16. Cache key changes when chunk text changes.
+17. Cache key changes when prompt version changes.
+18. Cache key changes when context model changes.
+19. Fake generator is deterministic.
+20. No live LLM call is required in unit tests.
+
+Expected:
+
+- contextualized text can be used for indexing
+- original text remains available for final context
+- generated context is not treated as source truth
+
+---
+
+## Fusion Tests
+
+Required tests:
+
+1. Empty ranked lists return empty results.
+2. Invalid top_k raises ValueError.
+3. Invalid rrf_k raises ValueError.
+4. RRF deduplicates by chunk_id.
+5. RRF preserves source results.
+6. RRF preserves source scores.
+7. RRF preserves contributing retrievers.
+8. RRF ranks overlapping high-rank results strongly.
+9. Stable tie-breaking uses chunk_id.
+10. Fused score is separate from raw scores.
+11. Metadata is preserved.
+12. Permission metadata survives fusion.
+13. Raw TF-IDF and cosine scores are not directly added.
+
+Example assertion direction:
+
+    def test_rrf_preserves_source_results():
+        fused = reciprocal_rank_fusion(
+            ranked_lists=[keyword_results, embedding_results],
+            top_k=10,
+            rrf_k=60,
+        )
+
+        result = fused[0]
+
+        assert result.fused_score > 0
+        assert result.source_results
+        assert result.contributing_retrievers
+
+---
+
+## Reranking Tests
+
+Required tests:
+
+1. Empty query raises ValueError.
+2. Empty fused results return empty list.
+3. Reranker is required when rerank is enabled.
+4. Reranker returns no more than top_k.
+5. Reranked results include rerank_score.
+6. Reranked results include rerank_rank.
+7. Previous fused rank is preserved.
+8. Score provenance is preserved.
+9. Metadata is preserved.
+10. Permission metadata is preserved.
+11. Reranking only receives the candidate pool.
+12. Fake reranker is deterministic.
+13. Live reranker tests are optional integration tests.
+
+Expected:
+
+- reranking improves ordering without hiding how the candidate was originally retrieved
+
+---
+
+## Context Building Tests
+
+Required tests:
+
+1. Empty results return empty context with warning.
+2. Invalid max_context_tokens raises ValueError.
+3. Invalid separator raises ValueError.
+4. Result order is preserved.
+5. Duplicate chunks are skipped.
+6. Duplicate skipped chunk IDs are tracked.
+7. Token budget is respected.
+8. Oversized chunks are skipped by default.
+9. Truncation is explicit when enabled.
+10. Truncated text is visibly marked.
+11. Source headers include document name.
+12. Source headers include chunk ID when requested.
+13. Page number appears when available.
+14. Section heading appears when available.
+15. Scores are included when requested.
+16. Scores are hidden when not requested.
+17. Score provenance is included when requested.
+18. Sensitive metadata is not exposed by default.
+19. Original text is returned when contextualized indexing was used.
+20. Warnings explain skipped chunks.
+
+Expected:
+
+- final context is bounded, readable, source-labeled, and auditable
+
+---
+
+## Storage Tests
+
+Required tests:
+
+1. Documents save and load successfully.
+2. Chunks save and load successfully.
+3. Metadata is preserved.
+4. Permission metadata is preserved.
+5. Filters return only matching chunks.
+6. Permission filters are enforced.
+7. Duplicate chunk ID behavior is explicit.
+8. Embedding model is stored and loaded.
+9. Embedding dimension is stored and loaded.
+10. Embedding provider is stored and loaded.
+11. indexed_text_type is stored and loaded.
+12. Model mismatch raises an error.
+13. Dimension mismatch raises an error.
+14. Contextualized text maps back to original chunk.
+15. Deleting a document removes associated chunks.
+16. Deleting a document removes associated embeddings.
+17. Deleting a document removes associated contextualized chunks.
+18. Reindexing replaces stale chunks.
+19. Cache key changes when text changes.
+20. API keys are never stored.
+21. Schema version mismatch raises an error.
+22. Storage adapters are replaceable.
+
+Expected:
+
+- storage does not silently return stale, unauthorized, or malformed artifacts
+
+---
+
+## Cache and Staleness Tests
+
+Required tests:
+
+1. Context cache key changes when chunk text changes.
+2. Context cache key changes when prompt version changes.
+3. Context cache key changes when context model changes.
+4. Embedding cache key changes when indexed text changes.
+5. Embedding cache key changes when embedding model changes.
+6. Embedding cache key changes when provider changes.
+7. Embedding cache key changes when indexed_text_type changes.
+8. Stale contextualized text is not reused silently.
+9. Stale embeddings are not reused silently.
+10. Deleted chunks are not returned from cache.
+
+Expected:
+
+- stale artifacts are detectable and invalidated
+
+---
+
+## Security and Permission Tests
+
+Required tests:
+
+1. API keys are not hardcoded.
+2. API keys are not printed.
+3. API keys are not stored in metadata.
+4. User-scoped retrieval returns only that user's chunks.
+5. Organization-scoped retrieval returns only that organization's chunks.
+6. Permission-scoped retrieval excludes unauthorized chunks.
+7. Permission metadata survives ingestion.
+8. Permission metadata survives chunking.
+9. Permission metadata survives contextualization.
+10. Permission metadata survives embedding.
+11. Permission metadata survives fusion.
+12. Permission metadata survives reranking.
+13. Context builder does not expose hidden permission metadata by default.
+14. External storage does not bypass filters.
+15. Logs do not include full sensitive documents by default.
+16. Logs do not include API keys or access tokens.
+
+Expected:
+
+- retrieval does not leak data across users, organizations, or permission scopes
+
+---
+
+## End-to-End Hybrid Retrieval Test
+
+A gold-standard end-to-end test should verify:
+
+1. Documents load.
+2. Text extracts.
+3. Chunks are created.
+4. Metadata is preserved.
+5. Permission metadata is preserved.
+6. Optional contextualization runs with fake generator.
+7. Keyword index builds.
+8. Embeddings are created using fake client.
+9. Keyword retrieval returns ranked results.
+10. Embedding retrieval returns ranked results.
+11. RRF fuses both result lists.
+12. Optional fake reranker reranks fused results.
+13. Context builder returns final context.
+14. Context respects token budget.
+15. Final response includes results, sources, warnings, and config used.
+
+Example flow:
+
+    def test_end_to_end_hybrid_retrieval():
+        document = make_test_document()
+
+        chunks = chunk_text_by_paragraph(
+            document,
+            max_tokens=500,
+        )
+
+        keyword_index = build_keyword_index(chunks)
+
+        embedding_client = FakeEmbeddingClient()
+
+        embedded_chunks = embed_chunks(
+            chunks=chunks,
+            embedding_client=embedding_client,
+            embedding_model="fake-model",
+            provider_name="fake",
+        )
+
+        embedding_index = build_embedding_index(
+            embedded_chunks=embedded_chunks,
+            provider_name="fake",
+            embedding_model="fake-model",
+        )
+
+        keyword_results = keyword_search(
+            query="financial revenue",
+            index=keyword_index,
+            top_k=10,
+        )
+
+        embedding_results = embedding_search(
+            query="financial revenue",
+            index=embedding_index,
+            embedding_client=embedding_client,
+            top_k=10,
+        )
+
+        fused_results = reciprocal_rank_fusion(
+            ranked_lists=[keyword_results, embedding_results],
+            top_k=10,
+        )
+
+        context_result = build_context_block(
+            fused_results[:5],
+            config=ContextBuildConfig(max_context_tokens=3000),
+        )
+
+        assert context_result.context
+        assert context_result.used_tokens <= 3000
+        assert context_result.included_sources
+        assert context_result.warnings is not None
+
+---
+
+## Regression Evaluation
+
+Enterprise RAG should include a small regression set.
+
+A regression set should include:
+
+- representative user queries
+- expected source documents
+- expected relevant chunks
+- unacceptable chunks
+- metadata filters
+- permission filters
+- expected retrieval strategy behavior
+
+Evaluate:
+
+- keyword-only retrieval
+- embedding-only retrieval
+- hybrid retrieval
+- contextualized hybrid retrieval
+- hybrid plus reranking
+
+Useful metrics:
+
+- recall@k
+- precision@k
+- mean reciprocal rank
+- exact expected chunk retrieved
+- source document retrieved
+- unauthorized result count
+- token budget pass rate
+
+Minimum enterprise regression requirement:
+
+- unauthorized result count must be zero
+- token budget violations must be zero
+- deleted chunks returned must be zero
+- stale chunks returned must be zero
+
+---
+
+## Test File Structure
+
+Recommended structure:
+
+    tests/
+      test_data_models.py
+      test_document_validation.py
+      test_chunking.py
+      test_token_counting.py
+      test_keyword_retrieval.py
+      test_embedding_retrieval.py
+      test_contextual_retrieval.py
+      test_fusion_and_reranking.py
+      test_context_building.py
+      test_storage.py
+      test_cache_and_staleness.py
+      test_security_and_permissions.py
+      test_end_to_end_hybrid_retrieval.py
+
+Optional integration tests:
+
+    tests/integration/
+      test_voyage_embedding_integration.py
+      test_real_context_generator_integration.py
+      test_real_reranker_integration.py
+      test_vector_database_integration.py
+
+Optional evaluation tests:
+
+    tests/evaluation/
+      test_retrieval_regression_set.py
+      test_hybrid_retrieval_quality.py
+      test_contextual_retrieval_quality.py
+
+---
+
+## Unit vs Integration Tests
+
+Unit tests:
+
+- deterministic
+- local
+- fast
+- no network
+- no paid APIs
+- use fake clients
+- run on every change
+
+Integration tests:
+
+- may use real providers
+- may require environment variables
+- may require network
+- may cost money
+- should be explicitly marked
+- should not run accidentally in normal unit test workflows
+
+Integration tests should require explicit opt-in.
+
+Example environment guard:
+
+    import os
+    import pytest
+
+
+    pytestmark = pytest.mark.skipif(
+        os.getenv("RUN_INTEGRATION_TESTS") != "true",
+        reason="Integration tests are disabled by default.",
+    )
+
+---
+
+## Bad vs Good
+
+Bad:
+
+    def test_rag():
+        assert rag("hello")
+
+Why bad:
+
+- vague
+- no expected behavior
+- no metadata check
+- no ranking check
+- no token-budget check
+- no permission check
+
+Bad:
+
+    def test_with_real_api_key():
+        client = VoyageEmbeddingClient(model="voyage-3-large")
+        assert client.embed_query("test")
+
+Why bad for unit tests:
+
+- requires network
+- requires paid API
+- can fail for reasons unrelated to logic
+- may leak secrets if mishandled
+- is not deterministic
+
+Bad:
+
+    def test_context():
+        assert build_context(results)
+
+Why bad:
+
+- does not check token budget
+- does not check source labels
+- does not check warnings
+- does not check skipped chunks
+- does not check sensitive metadata leakage
+
+Good:
+
+    def test_metadata_survives_hybrid_pipeline():
+        response = run_fake_hybrid_pipeline()
+
+        assert response.results
+        assert response.results[0].metadata["document_name"] == "Q4 Report"
+        assert response.context
+        assert response.included_sources
+
+Good:
+
+    def test_permission_filter_blocks_other_users():
+        results = retrieve_context_for_query(
+            query="financial revenue",
+            config=RetrievalConfig(
+                strategies=["keyword", "embedding"],
+                filters={"user_id": "user_123"},
+            ),
+        )
+
+        assert all(
+            result.metadata["user_id"] == "user_123"
+            for result in results.results
+        )
+
+---
+
+## Acceptance Criteria
+
+A RAG implementation passes enterprise validation only if:
+
+- empty inputs fail clearly
+- metadata is preserved
+- permission metadata is preserved
+- chunk IDs are stable
+- document IDs are stable
+- token budgets are respected
+- keyword retrieval is deterministic
+- embedding retrieval validates vectors and dimensions
+- embedding model mismatch is detected
+- contextual retrieval preserves original text
+- contextualized text is stored separately
+- RRF does not mix raw scores
+- reranking preserves previous rank and provenance
+- context building returns warnings
+- context building avoids sensitive metadata leakage
+- storage enforces filters
+- deletion removes associated artifacts
+- stale artifacts are detected
+- permission-scoped retrieval does not leak data
+- unit tests do not require live APIs
+- integration tests are clearly separated
+- regression tests catch retrieval quality drops
+
+---
+
+## Quality Checklist
+
+Before accepting tests and validation as gold standard, verify:
+
+- unit tests are deterministic
+- fake clients are used for paid APIs
+- integration tests are optional
+- malformed inputs are tested
+- empty inputs are tested
+- metadata preservation is tested
+- permission filtering is tested
+- tenant isolation is tested when relevant
+- token budget enforcement is tested
+- keyword ranking is tested
+- embedding dimension validation is tested
+- embedding model mismatch is tested
+- contextual text separation is tested
+- contextual cache invalidation is tested
+- embedding cache invalidation is tested
+- RRF provenance is tested
+- reranking provenance is tested
+- context building warnings are tested
+- storage persistence is tested
+- deletion behavior is tested
+- stale artifact behavior is tested
+- security failures are tested
+- end-to-end hybrid retrieval is tested
+- retrieval regression set exists for enterprise workflows
+"""
+
+output_path = Path("tests_and_validation.md")
+
+if output_path.exists():
+    raise FileExistsError(
+        "tests_and_validation.md already exists. "
+        "This script will not overwrite it. "
+        "Delete or rename the existing file if you intentionally want to recreate it."
+    )
+
+output_path.write_text(
+    tests_and_validation_md,
+    encoding="utf-8",
+)

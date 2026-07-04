@@ -1,0 +1,691 @@
+from pathlib import Path
+
+fusion_and_reranking_md = r"""# Fusion and Reranking Reference
+
+This file defines the expected standard for combining and reranking retrieval results in a modular RAG system.
+
+Fusion and reranking are ranking-layer operations. They happen after first-stage retrieval and before final context building.
+
+Typical flow:
+
+    keyword_search()
+    embedding_search()
+    metadata filters
+    -> reciprocal_rank_fusion()
+    -> optional rerank_results()
+    -> final top_k
+    -> build_context_block()
+
+---
+
+## Purpose
+
+Fusion combines ranked candidate lists from multiple retrievers.
+
+Reranking optionally reorders the fused candidate pool using a stronger query-document relevance model.
+
+Fusion is useful when:
+
+- keyword retrieval finds exact terms
+- embedding retrieval finds semantic matches
+- both retrievers return partially overlapping results
+- raw scores are not comparable
+- the system needs stronger ranking than either retriever alone
+
+Reranking is useful when:
+
+- first-stage retrieval returns a good but noisy candidate pool
+- semantic nuance matters
+- top result quality is more important than retrieval speed
+- a paid reranking API or local cross-encoder is acceptable
+
+---
+
+## Core Rule
+
+Do not directly add raw TF-IDF scores and cosine similarity scores.
+
+Bad:
+
+    final_score = tfidf_score + cosine_similarity
+
+Why bad:
+
+- TF-IDF and cosine similarity use different score ranges.
+- Scores are not calibrated.
+- One retriever can dominate by scale, not relevance.
+- The result is unstable across corpora.
+
+Recommended default:
+
+    Use Reciprocal Rank Fusion.
+
+RRF combines rank positions instead of raw score values.
+
+---
+
+## Required Behavior
+
+A gold-standard fusion and reranking implementation must:
+
+- accept multiple ranked result lists
+- deduplicate results by chunk_id
+- preserve original retriever scores
+- preserve metadata
+- preserve contributing retriever names
+- use stable tie-breaking
+- expose configurable top_k
+- expose configurable RRF constant
+- avoid mutating source results
+- support optional reranking
+- rerank only a candidate pool, not the full corpus
+- return score provenance
+- fail clearly when configuration is invalid
+
+---
+
+## Data Models
+
+This reference assumes RetrievalResult exists in the core reference.
+
+Minimal standalone Python-style contracts:
+
+    from __future__ import annotations
+
+    from dataclasses import dataclass
+    from typing import Any, Protocol
+
+
+    Metadata = dict[str, Any]
+
+
+    @dataclass(frozen=True)
+    class RetrievalResult:
+        chunk_id: str
+        document_id: str
+        text: str
+        token_count: int
+        metadata: Metadata
+        score: float
+        score_type: str
+        rank: int
+        retriever_name: str
+
+
+    @dataclass(frozen=True)
+    class FusedRetrievalResult:
+        chunk_id: str
+        document_id: str
+        text: str
+        token_count: int
+        metadata: Metadata
+        fused_score: float
+        fused_rank: int
+        source_results: list[RetrievalResult]
+        contributing_retrievers: list[str]
+
+
+    @dataclass(frozen=True)
+    class RerankedResult:
+        chunk_id: str
+        document_id: str
+        text: str
+        token_count: int
+        metadata: Metadata
+        rerank_score: float
+        rerank_rank: int
+        previous_rank: int
+        score_provenance: dict[str, Any]
+
+
+    @dataclass(frozen=True)
+    class FusionConfig:
+        method: str = "rrf"
+        top_k: int = 30
+        rrf_k: int = 60
+
+
+    @dataclass(frozen=True)
+    class RerankConfig:
+        enabled: bool = False
+        top_k: int = 5
+        candidate_pool_size: int = 30
+        reranker_name: str = ""
+
+---
+
+## Reciprocal Rank Fusion
+
+Function:
+
+    reciprocal_rank_fusion()
+
+Purpose:
+
+Combine multiple ranked result lists using rank position.
+
+Formula:
+
+    RRF score = sum(1 / (rrf_k + rank))
+
+Where:
+
+- rank is the result position inside a retriever's ranked list
+- rrf_k controls how strongly high ranks are favored
+- common default is 60 when defaults are allowed
+
+---
+
+## RRF Rules
+
+A gold-standard RRF implementation must:
+
+- use rank position, not raw score
+- deduplicate by chunk_id
+- preserve all original source results
+- preserve contributing retriever names
+- preserve metadata
+- sort by fused score descending
+- use stable tie-breaking by chunk_id
+- return fused_rank
+- allow configurable rrf_k
+- allow configurable top_k
+
+---
+
+## RRF Implementation
+
+    def reciprocal_rank_fusion(
+        *,
+        ranked_lists: list[list[RetrievalResult]],
+        top_k: int = 30,
+        rrf_k: int = 60,
+    ) -> list[FusedRetrievalResult]:
+        if top_k <= 0:
+            raise ValueError("top_k must be greater than zero.")
+
+        if rrf_k <= 0:
+            raise ValueError("rrf_k must be greater than zero.")
+
+        if not ranked_lists:
+            return []
+
+        fused_scores: dict[str, float] = {}
+        source_results: dict[str, list[RetrievalResult]] = {}
+        representative_results: dict[str, RetrievalResult] = {}
+
+        for ranked_list in ranked_lists:
+            for position, result in enumerate(ranked_list, start=1):
+                if not result.chunk_id or not result.chunk_id.strip():
+                    raise ValueError("RetrievalResult.chunk_id cannot be empty.")
+
+                fused_scores[result.chunk_id] = fused_scores.get(result.chunk_id, 0.0) + (
+                    1.0 / (rrf_k + position)
+                )
+
+                source_results.setdefault(result.chunk_id, []).append(result)
+
+                if result.chunk_id not in representative_results:
+                    representative_results[result.chunk_id] = result
+
+        sorted_chunk_ids = sorted(
+            fused_scores.keys(),
+            key=lambda chunk_id: (-fused_scores[chunk_id], chunk_id),
+        )
+
+        fused_results: list[FusedRetrievalResult] = []
+
+        for fused_rank, chunk_id in enumerate(sorted_chunk_ids[:top_k], start=1):
+            representative = representative_results[chunk_id]
+            sources = source_results[chunk_id]
+
+            contributing_retrievers = sorted(
+                {source.retriever_name for source in sources}
+            )
+
+            fused_results.append(
+                FusedRetrievalResult(
+                    chunk_id=representative.chunk_id,
+                    document_id=representative.document_id,
+                    text=representative.text,
+                    token_count=representative.token_count,
+                    metadata=representative.metadata,
+                    fused_score=fused_scores[chunk_id],
+                    fused_rank=fused_rank,
+                    source_results=sources,
+                    contributing_retrievers=contributing_retrievers,
+                )
+            )
+
+        return fused_results
+
+---
+
+## Fusion Wrapper
+
+Function:
+
+    fuse_rankings()
+
+Purpose:
+
+Provide a stable public fusion interface.
+
+    def fuse_rankings(
+        *,
+        ranked_lists: list[list[RetrievalResult]],
+        config: FusionConfig,
+    ) -> list[FusedRetrievalResult]:
+        if config.method == "rrf":
+            return reciprocal_rank_fusion(
+                ranked_lists=ranked_lists,
+                top_k=config.top_k,
+                rrf_k=config.rrf_k,
+            )
+
+        if config.method == "none":
+            if len(ranked_lists) != 1:
+                raise ValueError("Fusion method 'none' requires exactly one ranked list.")
+
+            single_list = ranked_lists[0]
+
+            return [
+                FusedRetrievalResult(
+                    chunk_id=result.chunk_id,
+                    document_id=result.document_id,
+                    text=result.text,
+                    token_count=result.token_count,
+                    metadata=result.metadata,
+                    fused_score=result.score,
+                    fused_rank=rank,
+                    source_results=[result],
+                    contributing_retrievers=[result.retriever_name],
+                )
+                for rank, result in enumerate(single_list[: config.top_k], start=1)
+            ]
+
+        raise ValueError(f"Unsupported fusion method: {config.method}")
+
+---
+
+## Score Provenance
+
+Fusion must preserve where each score came from.
+
+A fused result should make it possible to inspect:
+
+- original keyword score
+- original embedding score
+- original rank from each retriever
+- retriever name
+- fused score
+- fused rank
+
+Example provenance shape:
+
+    def build_fusion_score_provenance(
+        result: FusedRetrievalResult,
+    ) -> dict[str, Any]:
+        return {
+            "fused_score": result.fused_score,
+            "fused_rank": result.fused_rank,
+            "contributing_retrievers": result.contributing_retrievers,
+            "source_results": [
+                {
+                    "retriever_name": source.retriever_name,
+                    "score": source.score,
+                    "score_type": source.score_type,
+                    "rank": source.rank,
+                }
+                for source in result.source_results
+            ],
+        }
+
+Rules:
+
+- Do not overwrite source scores.
+- Do not hide retriever names.
+- Do not return fused score as if it were cosine similarity.
+- Keep fused score type separate from raw retriever score types.
+
+---
+
+## Reranker Interface
+
+Provider-specific reranking logic must be isolated.
+
+Use a protocol or wrapper.
+
+    class Reranker(Protocol):
+        def rerank(
+            self,
+            *,
+            query: str,
+            results: list[FusedRetrievalResult],
+            top_k: int,
+        ) -> list[tuple[FusedRetrievalResult, float]]:
+            ...
+
+Rules:
+
+- Do not call reranking APIs directly inside the retrieval orchestration function.
+- Do not hardcode reranker API keys.
+- Do not rerank the full corpus.
+- Rerank only the fused candidate pool.
+- Preserve previous ranks and score provenance.
+
+---
+
+## Rerank Results
+
+Function:
+
+    rerank_results()
+
+Purpose:
+
+Rerank a fused candidate pool and return final ranked results.
+
+Inputs:
+
+- query
+- fused results
+- reranker
+- top_k
+
+Output:
+
+- list[RerankedResult]
+
+    def rerank_results(
+        *,
+        query: str,
+        fused_results: list[FusedRetrievalResult],
+        reranker: Reranker,
+        top_k: int = 5,
+    ) -> list[RerankedResult]:
+        if not query or not query.strip():
+            raise ValueError("query cannot be empty.")
+
+        if top_k <= 0:
+            raise ValueError("top_k must be greater than zero.")
+
+        if not fused_results:
+            return []
+
+        reranked_pairs = reranker.rerank(
+            query=query,
+            results=fused_results,
+            top_k=top_k,
+        )
+
+        if len(reranked_pairs) > top_k:
+            raise RuntimeError("Reranker returned more results than requested top_k.")
+
+        reranked_results: list[RerankedResult] = []
+
+        for rerank_rank, (fused_result, rerank_score) in enumerate(
+            reranked_pairs,
+            start=1,
+        ):
+            reranked_results.append(
+                RerankedResult(
+                    chunk_id=fused_result.chunk_id,
+                    document_id=fused_result.document_id,
+                    text=fused_result.text,
+                    token_count=fused_result.token_count,
+                    metadata=fused_result.metadata,
+                    rerank_score=rerank_score,
+                    rerank_rank=rerank_rank,
+                    previous_rank=fused_result.fused_rank,
+                    score_provenance=build_fusion_score_provenance(fused_result),
+                )
+            )
+
+        return reranked_results
+
+---
+
+## Fake Reranker for Tests
+
+Unit tests should not depend on live API calls.
+
+    class FakeReranker:
+        def rerank(
+            self,
+            *,
+            query: str,
+            results: list[FusedRetrievalResult],
+            top_k: int,
+        ) -> list[tuple[FusedRetrievalResult, float]]:
+            scored: list[tuple[FusedRetrievalResult, float]] = []
+
+            query_terms = set(query.lower().split())
+
+            for result in results:
+                text_terms = set(result.text.lower().split())
+                overlap = len(query_terms & text_terms)
+                score = float(overlap)
+
+                scored.append((result, score))
+
+            scored.sort(
+                key=lambda item: (-item[1], item[0].chunk_id)
+            )
+
+            return scored[:top_k]
+
+Rules:
+
+- Unit tests should use fake rerankers.
+- Integration tests may use real APIs only when explicitly enabled.
+- Reranker behavior must be deterministic in unit tests.
+
+---
+
+## Recommended Hybrid Retrieval Flow
+
+    def hybrid_retrieve_with_fusion_and_optional_rerank(
+        *,
+        query: str,
+        keyword_results: list[RetrievalResult],
+        embedding_results: list[RetrievalResult],
+        candidate_pool_size: int = 30,
+        top_k: int = 5,
+        rerank: bool = False,
+        reranker: Reranker | None = None,
+    ) -> list[FusedRetrievalResult] | list[RerankedResult]:
+        if candidate_pool_size < top_k:
+            raise ValueError("candidate_pool_size must be greater than or equal to top_k.")
+
+        fused_results = reciprocal_rank_fusion(
+            ranked_lists=[keyword_results, embedding_results],
+            top_k=candidate_pool_size,
+            rrf_k=60,
+        )
+
+        if not rerank:
+            return fused_results[:top_k]
+
+        if reranker is None:
+            raise ValueError("reranker is required when rerank=True.")
+
+        return rerank_results(
+            query=query,
+            fused_results=fused_results,
+            reranker=reranker,
+            top_k=top_k,
+        )
+
+---
+
+## When to Use Reranking
+
+Use reranking when:
+
+- result quality matters more than latency
+- the candidate pool is already reasonably small
+- the query is nuanced
+- the corpus has overlapping chunks
+- first-stage retrieval is noisy
+- the user has approved the cost
+
+Do not use reranking when:
+
+- the system must be fully local and no local reranker is selected
+- latency must be minimal
+- the user has not approved paid API calls
+- candidate pool size is too large
+- the system has no stable first-stage retrieval
+
+---
+
+## Candidate Pool Rules
+
+Recommended pattern:
+
+    top_k = 5
+    candidate_pool_size = 30
+
+Rules:
+
+- candidate_pool_size must be greater than or equal to top_k.
+- First-stage retrievers should usually retrieve candidate_pool_size.
+- Fusion should return up to candidate_pool_size.
+- Reranking should select final top_k.
+- Context building should use final top_k, not the whole candidate pool.
+
+---
+
+## Metadata and Permission Rules
+
+Fusion and reranking must preserve metadata.
+
+Required:
+
+- document_id
+- document_name when available
+- chunk_id
+- user_id when available
+- organization_id when available
+- permissions when available
+- source URL when available
+- page number when available
+- tags when available
+
+Never allow fusion or reranking to reintroduce results that were removed by permission filters.
+
+Permission filters must happen before final results are returned.
+
+---
+
+## Error Handling
+
+Raise clear errors for:
+
+- invalid top_k
+- invalid rrf_k
+- unsupported fusion method
+- reranking requested without reranker
+- empty query when reranking
+- result with missing chunk ID
+- candidate pool smaller than top_k
+- malformed reranker response
+
+Return empty lists safely when:
+
+- all ranked lists are empty
+- no candidates survive filtering
+- reranker receives an empty candidate list
+
+---
+
+## Tests
+
+A gold-standard fusion and reranking implementation should test:
+
+1. Empty ranked lists return empty results.
+2. Invalid top_k raises ValueError.
+3. Invalid rrf_k raises ValueError.
+4. RRF deduplicates by chunk_id.
+5. RRF preserves source scores.
+6. RRF preserves contributing retriever names.
+7. RRF ranks overlapping high-rank results strongly.
+8. Stable tie-breaking uses chunk_id.
+9. Reranking requires non-empty query.
+10. Reranking preserves previous fused rank.
+11. Reranking preserves score provenance.
+12. Reranking runs only on candidate pool.
+13. Reranking requires reranker when enabled.
+14. Permission metadata survives fusion and reranking.
+15. Candidate pool size must be greater than or equal to top_k.
+
+---
+
+## Bad vs Good
+
+Bad:
+
+    final_score = keyword_score + embedding_score
+
+Why bad:
+
+- incompatible score scales
+- unstable ranking
+- no provenance
+
+Bad:
+
+    def rerank_everything(query, all_chunks):
+        pass
+
+Why bad:
+
+- reranks full corpus
+- expensive
+- slow
+- ignores first-stage retrieval
+
+Good:
+
+    keyword_results = keyword_search(...)
+    embedding_results = embedding_search(...)
+
+    fused_results = reciprocal_rank_fusion(
+        ranked_lists=[keyword_results, embedding_results],
+        top_k=30,
+    )
+
+    final_results = rerank_results(
+        query=query,
+        fused_results=fused_results,
+        reranker=reranker,
+        top_k=5,
+    )
+
+---
+
+## Quality Checklist
+
+Before accepting fusion and reranking as gold standard, verify:
+
+- raw TF-IDF and cosine scores are not directly added
+- RRF is implemented by rank position
+- chunk_id is used for deduplication
+- original scores are preserved
+- contributing retrievers are preserved
+- fused score is separate from raw scores
+- reranking is optional
+- reranking runs only on candidate pool
+- reranker logic is provider-isolated
+- previous ranks are preserved
+- score provenance is returned
+- metadata is preserved
+- permission filters are not bypassed
+- tests cover overlap, ties, empty results, and reranker failure
+"""
+
+Path("fusion_and_reranking.md").write_text(
+    fusion_and_reranking_md,
+    encoding="utf-8",
+)

@@ -1,0 +1,926 @@
+# Embedding Retrieval Reference
+
+This file defines the expected standard for embedding-based retrieval in a modular RAG system.
+
+Embedding retrieval should be usable by itself or as one first-stage retriever inside a hybrid retrieval pipeline with keyword retrieval, Reciprocal Rank Fusion, contextual retrieval preprocessing, and optional reranking.
+
+The default embedding provider in this reference is Voyage AI, but provider-specific logic must remain isolated behind a wrapper.
+
+---
+
+## Purpose
+
+Embedding retrieval helps retrieve chunks based on semantic similarity rather than exact keyword overlap.
+
+It is useful when:
+
+* the query uses different wording than the document
+* the user asks conceptual questions
+* the document uses synonyms or related language
+* the user asks broad questions across many documents
+* exact keyword matching would miss relevant chunks
+
+Embedding retrieval should not replace keyword retrieval in every system.
+
+Keyword retrieval is often better for:
+
+* exact names
+* IDs
+* error messages
+* legal terms
+* financial terms
+* product codes
+* citations
+* exact phrases
+
+For strong production retrieval, embedding retrieval is often paired with keyword retrieval and fused using RRF.
+
+---
+
+## Required Behavior
+
+A gold-standard embedding retriever must:
+
+* validate input chunks
+* reject empty text
+* use a provider wrapper for embeddings
+* avoid hardcoded API keys
+* embed documents with the correct document input mode when available
+* embed queries with the correct query input mode when available
+* preserve metadata
+* validate vector dimensions
+* calculate similarity safely
+* return ranked results
+* include similarity scores
+* include rank
+* include retriever name
+* support metadata filters when requested
+* return an empty list safely when no chunks are available
+* avoid mutating source chunks
+
+---
+
+## Data Models
+
+This reference assumes these models exist in the core reference:
+
+* TextChunk
+* EmbeddedChunk
+* RetrievalResult
+
+For standalone use, the minimal versions are shown below.
+
+```python id="0ws9at"
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+import math
+import os
+
+
+Metadata = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TextChunk:
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EmbeddedChunk:
+    chunk: TextChunk
+    embedding: list[float]
+    embedding_model: str
+    metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EmbeddingIndex:
+    embedded_chunks: list[EmbeddedChunk]
+    embedding_model: str
+    embedding_dimension: int
+    provider_name: str
+
+
+@dataclass(frozen=True)
+class RetrievalResult:
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata
+    score: float
+    score_type: str
+    rank: int
+    retriever_name: str
+```
+
+---
+
+## Provider Isolation Rule
+
+Embedding provider logic must be isolated.
+
+Bad:
+
+```python id="kdu6gy"
+def retrieve(query, chunks):
+    client = voyageai.Client(api_key="hardcoded-key")
+    # embedding and retrieval mixed together
+```
+
+Good:
+
+```python id="uv3d7a"
+class VoyageEmbeddingClient:
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        ...
+
+    def embed_query(self, query: str) -> list[float]:
+        ...
+```
+
+Rules:
+
+* Do not hardcode API keys.
+* Use environment variables for secrets.
+* Do not print secrets.
+* Do not mix provider calls with ranking logic.
+* Keep the embedding client replaceable.
+
+---
+
+## Voyage Embedding Client
+
+Functionality:
+
+* validate API key
+* embed document chunks
+* embed user queries
+* use provider-specific input types correctly
+* return raw vectors only
+
+```python id="4xg5aa"
+class VoyageEmbeddingClient:
+    def __init__(self, *, model: str) -> None:
+        try:
+            import voyageai
+        except ImportError as exc:
+            raise RuntimeError(
+                "voyageai is not installed. Install it before using VoyageEmbeddingClient."
+            ) from exc
+
+        api_key = os.getenv("VOYAGE_API_KEY")
+
+        if not api_key:
+            raise RuntimeError("Missing VOYAGE_API_KEY environment variable.")
+
+        if not model or not model.strip():
+            raise ValueError("model cannot be empty.")
+
+        self.model = model
+        self.client = voyageai.Client(api_key=api_key)
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            raise ValueError("texts cannot be empty.")
+
+        cleaned_texts = []
+
+        for text in texts:
+            if not text or not text.strip():
+                raise ValueError("Document text cannot be empty.")
+            cleaned_texts.append(text.strip())
+
+        response = self.client.embed(
+            cleaned_texts,
+            model=self.model,
+            input_type="document",
+        )
+
+        return response.embeddings
+
+    def embed_query(self, query: str) -> list[float]:
+        if not query or not query.strip():
+            raise ValueError("query cannot be empty.")
+
+        response = self.client.embed(
+            [query.strip()],
+            model=self.model,
+            input_type="query",
+        )
+
+        return response.embeddings[0]
+```
+
+---
+
+## Embedding Chunk Function
+
+Function:
+
+```python id="g86vwd"
+embed_chunks()
+```
+
+Purpose:
+
+Create embeddings for text chunks.
+
+Inputs:
+
+* chunks
+* embedding client
+* embedding model
+
+Output:
+
+* list[EmbeddedChunk]
+
+Rules:
+
+* Reject empty chunk lists.
+* Reject empty chunk text.
+* Preserve the original TextChunk.
+* Preserve metadata.
+* Validate that the number of embeddings matches the number of chunks.
+* Validate embedding dimensions.
+* Do not mutate chunks.
+
+```python id="e4g5rm"
+def embed_chunks(
+    *,
+    chunks: list[TextChunk],
+    embedding_client: VoyageEmbeddingClient,
+    embedding_model: str,
+) -> list[EmbeddedChunk]:
+    if not chunks:
+        raise ValueError("chunks cannot be empty.")
+
+    texts: list[str] = []
+
+    for chunk in chunks:
+        if not chunk.text or not chunk.text.strip():
+            raise ValueError(f"Chunk text cannot be empty: {chunk.chunk_id}")
+        texts.append(chunk.text)
+
+    embeddings = embedding_client.embed_documents(texts)
+
+    if len(embeddings) != len(chunks):
+        raise RuntimeError(
+            f"Embedding count mismatch. Expected {len(chunks)}, got {len(embeddings)}."
+        )
+
+    embedded_chunks: list[EmbeddedChunk] = []
+
+    expected_dimension: int | None = None
+
+    for chunk, embedding in zip(chunks, embeddings):
+        validate_embedding_vector(embedding)
+
+        if expected_dimension is None:
+            expected_dimension = len(embedding)
+        elif len(embedding) != expected_dimension:
+            raise ValueError("All embeddings must have the same dimension.")
+
+        embedded_chunks.append(
+            EmbeddedChunk(
+                chunk=chunk,
+                embedding=embedding,
+                embedding_model=embedding_model,
+                metadata={
+                    **chunk.metadata,
+                    "embedding_model": embedding_model,
+                },
+            )
+        )
+
+    return embedded_chunks
+```
+
+---
+
+## Embedding Vector Validation
+
+Function:
+
+```python id="545o5s"
+validate_embedding_vector()
+```
+
+Purpose:
+
+Ensure vectors are usable before similarity search.
+
+```python id="ouwwlu"
+def validate_embedding_vector(vector: list[float]) -> None:
+    if not vector:
+        raise ValueError("Embedding vector cannot be empty.")
+
+    for value in vector:
+        if not isinstance(value, int | float):
+            raise ValueError("Embedding vector must contain only numeric values.")
+
+        if math.isnan(value) or math.isinf(value):
+            raise ValueError("Embedding vector cannot contain NaN or infinity.")
+```
+
+Rules:
+
+* Reject empty vectors.
+* Reject non-numeric values.
+* Reject NaN.
+* Reject infinity.
+* Validate dimensions before similarity calculation.
+
+---
+
+## Cosine Similarity
+
+Function:
+
+```python id="e9z7u8"
+cosine_similarity()
+```
+
+Purpose:
+
+Calculate semantic similarity between two embedding vectors.
+
+```python id="6s1x2s"
+def cosine_similarity(vector_a: list[float], vector_b: list[float]) -> float:
+    validate_embedding_vector(vector_a)
+    validate_embedding_vector(vector_b)
+
+    if len(vector_a) != len(vector_b):
+        raise ValueError("Vectors must have the same dimension.")
+
+    dot_product = sum(a * b for a, b in zip(vector_a, vector_b))
+    magnitude_a = math.sqrt(sum(a * a for a in vector_a))
+    magnitude_b = math.sqrt(sum(b * b for b in vector_b))
+
+    if magnitude_a == 0 or magnitude_b == 0:
+        return 0.0
+
+    return dot_product / (magnitude_a * magnitude_b)
+```
+
+Rules:
+
+* Validate both vectors.
+* Reject dimension mismatch.
+* Return 0.0 for zero-magnitude vectors.
+* Do not silently compare incompatible embeddings.
+
+---
+
+## Build Embedding Index
+
+Function:
+
+```python id="ee2sl9"
+build_embedding_index()
+```
+
+Purpose:
+
+Create an in-memory embedding index from embedded chunks.
+
+Inputs:
+
+* embedded chunks
+* provider name
+* embedding model
+
+Output:
+
+* EmbeddingIndex
+
+```python id="13az7n"
+def build_embedding_index(
+    *,
+    embedded_chunks: list[EmbeddedChunk],
+    provider_name: str,
+    embedding_model: str,
+) -> EmbeddingIndex:
+    if not embedded_chunks:
+        raise ValueError("embedded_chunks cannot be empty.")
+
+    if not provider_name or not provider_name.strip():
+        raise ValueError("provider_name cannot be empty.")
+
+    if not embedding_model or not embedding_model.strip():
+        raise ValueError("embedding_model cannot be empty.")
+
+    first_dimension = len(embedded_chunks[0].embedding)
+
+    if first_dimension <= 0:
+        raise ValueError("embedding dimension must be greater than zero.")
+
+    for item in embedded_chunks:
+        validate_embedding_vector(item.embedding)
+
+        if len(item.embedding) != first_dimension:
+            raise ValueError("All embeddings in the index must have the same dimension.")
+
+        if item.embedding_model != embedding_model:
+            raise ValueError(
+                f"Embedding model mismatch for chunk {item.chunk.chunk_id}."
+            )
+
+    return EmbeddingIndex(
+        embedded_chunks=embedded_chunks,
+        embedding_model=embedding_model,
+        embedding_dimension=first_dimension,
+        provider_name=provider_name,
+    )
+```
+
+---
+
+## Metadata Filtering
+
+Function:
+
+```python id="evygcz"
+metadata_matches_filters()
+```
+
+Purpose:
+
+Filter chunks before scoring or before returning results.
+
+```python id="7fk8kx"
+def metadata_matches_filters(
+    metadata: dict[str, Any],
+    filters: dict[str, Any],
+) -> bool:
+    for key, expected_value in filters.items():
+        actual_value = metadata.get(key)
+
+        if isinstance(expected_value, list | tuple | set):
+            if actual_value not in expected_value:
+                return False
+        else:
+            if actual_value != expected_value:
+                return False
+
+    return True
+```
+
+Rules:
+
+* Apply permission filters before returning results.
+* Never ignore user, organization, or permission filters in scoped retrieval.
+* Keep filter behavior explicit.
+* Do not silently retrieve documents outside the allowed scope.
+
+---
+
+## Embedding Search
+
+Function:
+
+```python id="6d0w1r"
+embedding_search()
+```
+
+Purpose:
+
+Retrieve chunks ranked by semantic similarity to a query.
+
+Inputs:
+
+* query
+* embedding index
+* embedding client
+* top_k
+* filters
+
+Output:
+
+* list[RetrievalResult]
+
+Rules:
+
+* Reject empty query.
+* Reject invalid top_k.
+* Return empty list safely when the index is empty.
+* Preserve metadata.
+* Include score_type as "cosine_similarity".
+* Include retriever_name as "embedding_voyage".
+* Sort by score descending.
+* Use stable tie-breaking by chunk_id.
+* Validate query embedding dimension against index dimension.
+
+```python id="07ka5w"
+def embedding_search(
+    *,
+    query: str,
+    index: EmbeddingIndex,
+    embedding_client: VoyageEmbeddingClient,
+    top_k: int = 5,
+    filters: dict[str, Any] | None = None,
+) -> list[RetrievalResult]:
+    if not query or not query.strip():
+        raise ValueError("query cannot be empty.")
+
+    if top_k <= 0:
+        raise ValueError("top_k must be greater than zero.")
+
+    if not index.embedded_chunks:
+        return []
+
+    active_filters = filters or {}
+
+    query_embedding = embedding_client.embed_query(query)
+
+    validate_embedding_vector(query_embedding)
+
+    if len(query_embedding) != index.embedding_dimension:
+        raise ValueError(
+            "Query embedding dimension does not match index embedding dimension."
+        )
+
+    scored_results: list[tuple[float, EmbeddedChunk]] = []
+
+    for item in index.embedded_chunks:
+        if not metadata_matches_filters(item.chunk.metadata, active_filters):
+            continue
+
+        score = cosine_similarity(query_embedding, item.embedding)
+
+        scored_results.append((score, item))
+
+    scored_results.sort(
+        key=lambda item: (-item[0], item[1].chunk.chunk_id)
+    )
+
+    results: list[RetrievalResult] = []
+
+    for rank, (score, item) in enumerate(scored_results[:top_k], start=1):
+        chunk = item.chunk
+
+        results.append(
+            RetrievalResult(
+                chunk_id=chunk.chunk_id,
+                document_id=chunk.document_id,
+                text=chunk.text,
+                token_count=chunk.token_count,
+                metadata=chunk.metadata,
+                score=score,
+                score_type="cosine_similarity",
+                rank=rank,
+                retriever_name="embedding_voyage",
+            )
+        )
+
+    return results
+```
+
+---
+
+## Example Usage
+
+```python id="lt65ra"
+chunks = [
+    TextChunk(
+        chunk_id="doc-1:chunk-0",
+        document_id="doc-1",
+        text="The company increased operating margin through reduced infrastructure spend.",
+        token_count=13,
+        metadata={
+            "document_name": "Q4 Financial Report",
+            "page_number": 4,
+            "user_id": "user_123",
+        },
+    ),
+    TextChunk(
+        chunk_id="doc-2:chunk-0",
+        document_id="doc-2",
+        text="Users can reset their password from the account settings page.",
+        token_count=11,
+        metadata={
+            "document_name": "Help Center",
+            "page_number": 1,
+            "user_id": "user_123",
+        },
+    ),
+]
+
+embedding_client = VoyageEmbeddingClient(model="voyage-3-large")
+
+embedded_chunks = embed_chunks(
+    chunks=chunks,
+    embedding_client=embedding_client,
+    embedding_model="voyage-3-large",
+)
+
+index = build_embedding_index(
+    embedded_chunks=embedded_chunks,
+    provider_name="voyage",
+    embedding_model="voyage-3-large",
+)
+
+results = embedding_search(
+    query="How did the company improve profitability?",
+    index=index,
+    embedding_client=embedding_client,
+    top_k=3,
+    filters={"user_id": "user_123"},
+)
+```
+
+Expected behavior:
+
+* The financial report chunk should rank above the password reset chunk.
+* Results should include cosine similarity scores.
+* Metadata should be preserved.
+* Permission filters should be applied.
+
+---
+
+## Embedding Retrieval in Hybrid Search
+
+Embedding retrieval can be used as one first-stage retriever.
+
+Typical hybrid retrieval:
+
+```python id="w3dj1v"
+keyword_results = keyword_search(
+    query=query,
+    index=keyword_index,
+    top_k=candidate_pool_size,
+    filters=filters,
+)
+
+embedding_results = embedding_search(
+    query=query,
+    index=embedding_index,
+    embedding_client=embedding_client,
+    top_k=candidate_pool_size,
+    filters=filters,
+)
+
+fused_results = reciprocal_rank_fusion(
+    ranked_lists=[keyword_results, embedding_results],
+    top_k=candidate_pool_size,
+)
+
+final_results = fused_results[:top_k]
+```
+
+Rules:
+
+* Do not directly add cosine similarity scores to TF-IDF scores.
+* Use RRF or a documented score-normalization strategy.
+* Preserve each retriever's original scores.
+* Deduplicate by chunk_id.
+* Keep score provenance.
+
+---
+
+## Contextualized Embedding Retrieval
+
+When contextual retrieval preprocessing is enabled:
+
+* generate contextualized text during ingestion
+* embed the contextualized text
+* preserve the original chunk text
+* return original chunk text in final context unless requested otherwise
+
+Example:
+
+```python id="0n1nig"
+texts_to_embed = [
+    contextualized_chunk.contextualized_text
+    for contextualized_chunk in contextualized_chunks
+]
+```
+
+Rules:
+
+* Use contextualized text for indexing.
+* Use original text for final answer context.
+* Store the context summary for debugging.
+* Do not permanently replace original text with synthetic text.
+
+---
+
+## Batch Embedding Rules
+
+For production systems:
+
+* batch embedding requests
+* respect provider rate limits
+* retry transient failures
+* avoid retrying validation errors
+* log batch sizes, not sensitive content
+* do not log full document text by default
+* preserve input order when mapping embeddings back to chunks
+
+Provider wrappers should expose batching options only if needed.
+
+---
+
+## Storage Rules
+
+Embedding storage must preserve:
+
+* chunk_id
+* document_id
+* original text or pointer to original text
+* embedding vector
+* embedding model
+* embedding dimension
+* metadata
+* created_at or indexed_at timestamp when useful
+
+Do not mix embeddings from different models in the same index unless the index explicitly supports model separation.
+
+---
+
+## Error Handling
+
+Raise clear errors for:
+
+* empty query
+* empty chunks
+* empty chunk text
+* missing API key
+* invalid embedding model
+* empty embedding vector
+* NaN or infinite vector values
+* embedding dimension mismatch
+* embedding count mismatch
+* unsupported provider
+* invalid top_k
+* missing retriever dependency
+
+Do not fail silently.
+
+---
+
+## Tests
+
+A gold-standard embedding retriever should include tests for the following cases.
+
+### Test 1 — Empty Query
+
+Input:
+
+```python id="vki5op"
+query = ""
+```
+
+Expected:
+
+```python id="tvol1d"
+ValueError
+```
+
+### Test 2 — Empty Chunk List
+
+Input:
+
+```python id="888m6w"
+chunks = []
+```
+
+Expected:
+
+```python id="krakxu"
+ValueError
+```
+
+### Test 3 — Embedding Count Mismatch
+
+Expected:
+
+* if provider returns fewer embeddings than chunks, raise RuntimeError
+
+### Test 4 — Dimension Mismatch
+
+Expected:
+
+* vectors with different dimensions raise ValueError
+
+### Test 5 — Similarity Ranking
+
+Expected:
+
+* semantically relevant chunk ranks higher than unrelated chunk
+
+### Test 6 — Metadata Preservation
+
+Expected:
+
+* document_name remains available
+* page_number remains available
+* user_id remains available when present
+
+### Test 7 — Filters Are Applied
+
+Input:
+
+```python id="gr34g7"
+filters = {"user_id": "user_123"}
+```
+
+Expected:
+
+* only chunks with matching user_id are returned
+
+### Test 8 — Stable Tie-Breaking
+
+Expected:
+
+* equal scores sort by chunk_id
+* repeated runs return the same order
+
+### Test 9 — Missing API Key
+
+Expected:
+
+* missing VOYAGE_API_KEY raises RuntimeError
+
+---
+
+## Bad vs Good
+
+Bad:
+
+```python id="ef01kl"
+def retrieve(query, chunks):
+    # embeds query, embeds documents, ranks, filters, and formats context all together
+    pass
+```
+
+Why bad:
+
+* provider logic is mixed with retrieval logic
+* no reusable index
+* no metadata contract
+* no score provenance
+* no stable function boundaries
+
+Bad:
+
+```python id="zdlrda"
+api_key = "sk_live_..."
+```
+
+Why bad:
+
+* hardcoded secret
+* unsafe for production
+* cannot be shared or committed
+
+Good:
+
+```python id="4h59lj"
+VoyageEmbeddingClient()
+embed_chunks()
+build_embedding_index()
+cosine_similarity()
+embedding_search()
+```
+
+Each function has:
+
+* clear input
+* clear output
+* clear error behavior
+* metadata preservation
+* provider isolation
+* testable ranking logic
+
+---
+
+## Quality Checklist
+
+Before accepting embedding retrieval as gold standard, verify:
+
+* API key is not hardcoded
+* provider logic is isolated
+* chunks are validated
+* embeddings are validated
+* vector dimensions are checked
+* query embedding dimension matches index dimension
+* cosine similarity is safe
+* retrieval returns ranked results
+* results include similarity scores
+* results include retriever_name
+* metadata is preserved
+* filters are supported
+* tie-breaking is stable
+* embeddings from different models are not mixed accidentally
+* no raw score mixing with keyword retrieval
+* tests cover provider errors
+* tests cover metadata preservation
+* tests cover dimension mismatch

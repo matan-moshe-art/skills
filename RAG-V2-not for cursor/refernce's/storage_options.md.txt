@@ -1,0 +1,1449 @@
+from pathlib import Path
+
+storage_options_md = r"""# Storage Options Reference
+
+This file defines the expected enterprise standard for selecting and designing storage in a modular RAG system.
+
+Storage affects:
+
+- ingestion
+- indexing
+- retrieval
+- metadata filtering
+- permission enforcement
+- persistence
+- scalability
+- cost
+- observability
+- deletion
+- reindexing
+- auditability
+- security
+
+Do not assume a vector database unless the user explicitly selects one or allows a default.
+
+Storage must be chosen based on the user's runtime, corpus size, retrieval strategy, persistence needs, security model, and operational constraints.
+
+---
+
+## Purpose
+
+A RAG system may need to store:
+
+- raw documents
+- extracted text
+- normalized text
+- chunks
+- chunk metadata
+- contextualized text
+- context summaries
+- keyword indexes
+- embeddings
+- vector indexes
+- retrieval logs
+- cache entries
+- rerank outputs
+- evaluation datasets
+- ingestion status
+- deletion markers
+- audit records
+
+A gold-standard storage design must make retrieval reliable, traceable, secure, and replaceable.
+
+Storage is not only a place to save vectors.
+
+Storage is the backbone that allows an enterprise RAG system to answer:
+
+- where did this result come from?
+- who is allowed to see it?
+- which model created this embedding?
+- which text was indexed?
+- was contextualized text used?
+- when was this chunk generated?
+- is this chunk stale?
+- can this document be deleted cleanly?
+- can this result be audited later?
+
+---
+
+## Core Enterprise Rule
+
+Ask before choosing storage.
+
+Do not assume:
+
+- Pinecone
+- Qdrant
+- Chroma
+- Weaviate
+- Supabase
+- PostgreSQL
+- SQLite
+- Redis
+- JSON files
+- in-memory storage
+
+The storage backend must be either:
+
+1. selected by the user, or
+2. explicitly allowed as a default, or
+3. clearly scoped as an example only.
+
+Never design the system around a vector database unless the user needs vector persistence, scale, or managed vector search.
+
+---
+
+## Required Behavior
+
+A gold-standard storage design must:
+
+- preserve document IDs
+- preserve chunk IDs
+- preserve metadata
+- preserve permission metadata
+- preserve tenant metadata
+- track embedding model
+- track embedding dimension
+- track embedding provider
+- track indexed text type
+- track contextualization model
+- track contextualization prompt version
+- separate original text from contextualized text
+- support metadata filters when required
+- support permission-scoped retrieval when required
+- support deletion and reindexing
+- avoid storing API keys
+- avoid storing secrets
+- make stale indexes detectable
+- make storage adapters replaceable
+- support deterministic tests
+- avoid coupling retrieval logic to one database
+- avoid silently dropping chunks or metadata
+
+---
+
+## Storage Decision Factors
+
+Before selecting storage, determine the following.
+
+### 1. Corpus Size
+
+Examples:
+
+- fewer than 1,000 chunks
+- 1,000 to 100,000 chunks
+- 100,000 to 1,000,000 chunks
+- millions of chunks
+
+Why it matters:
+
+- small corpora can use in-memory, JSON, or SQLite
+- medium corpora often need SQLite, PostgreSQL, or vector indexes
+- large corpora often need PostgreSQL with pgvector or a dedicated vector database
+
+### 2. Persistence Requirement
+
+Examples:
+
+- temporary in-memory only
+- local persistent files
+- local database
+- production persistent index
+- distributed persistent storage
+
+Why it matters:
+
+- prototypes can rebuild indexes on restart
+- production systems usually cannot
+- serverless runtimes may not support durable local disk
+
+### 3. Retrieval Strategies
+
+Examples:
+
+- keyword only
+- embedding only
+- hybrid keyword plus embedding
+- contextualized hybrid
+- metadata filtering
+- permission-scoped retrieval
+- reranking
+
+Why it matters:
+
+- keyword indexes and vector indexes have different storage needs
+- hybrid retrieval often needs both lexical and vector storage
+- contextual retrieval requires storing original and contextualized text separately
+
+### 4. Runtime and Deployment
+
+Examples:
+
+- local script
+- FastAPI app
+- Flask app
+- Django app
+- Node.js service
+- Next.js app
+- serverless function
+- background worker
+- enterprise backend
+
+Why it matters:
+
+- local scripts can use files or SQLite
+- web apps often need shared persistent storage
+- serverless systems need external storage
+- enterprise systems often need audit logs and permission enforcement
+
+### 5. Security Scope
+
+Examples:
+
+- personal local corpus
+- single-user app
+- team workspace
+- multi-tenant SaaS
+- organization-scoped enterprise search
+- permission-scoped document retrieval
+
+Why it matters:
+
+- permission metadata must survive every storage layer
+- tenant data may need namespace isolation
+- sensitive systems should not rely only on final client-side filtering
+
+### 6. Update Pattern
+
+Examples:
+
+- static corpus
+- occasional uploads
+- frequent document updates
+- real-time ingestion
+- deletion and reindexing required
+- legal deletion requirements
+
+Why it matters:
+
+- static corpora can rebuild indexes cheaply
+- frequently changing corpora need update and invalidation logic
+- deletion requires removing chunks, embeddings, keyword entries, contextualized text, and caches
+
+### 7. Operational Complexity
+
+Examples:
+
+- no external services
+- managed vector database acceptable
+- existing PostgreSQL preferred
+- cloud-native architecture required
+- local-only required
+
+Why it matters:
+
+- simple storage lowers setup burden
+- managed storage improves scale but adds cost and vendor dependency
+- enterprise teams often prefer existing infrastructure
+
+---
+
+## Storage Option Matrix
+
+### In-Memory Storage
+
+Use when:
+
+- prototyping
+- unit testing
+- small local demos
+- no persistence is needed
+- examples should be dependency-light
+
+Pros:
+
+- simple
+- fast
+- no external dependency
+- easy to test
+- easy to reset
+
+Cons:
+
+- lost on restart
+- not shared across processes
+- not suitable for production persistence
+- not suitable for large corpora
+- not suitable for multi-user retrieval
+
+Good for:
+
+- unit tests
+- examples
+- local proof of concept
+- fake stores
+
+Do not use when:
+
+- production persistence is required
+- multiple app instances need shared indexes
+- deletion and auditability matter
+
+---
+
+### JSON Files
+
+Use when:
+
+- small corpus
+- local persistence needed
+- examples should stay simple
+- no concurrent writes are expected
+- human inspection is useful
+
+Pros:
+
+- simple
+- inspectable
+- portable
+- no database setup
+- easy to copy
+
+Cons:
+
+- poor concurrency
+- slow for large corpora
+- awkward for vector search
+- manual index loading required
+- easy to corrupt without careful writes
+
+Good for:
+
+- small offline tools
+- reference implementations
+- generated examples
+- local demos
+
+Do not use when:
+
+- concurrent users write data
+- corpus is large
+- strict auditability is required
+- high-performance vector search is required
+
+---
+
+### SQLite
+
+Use when:
+
+- local persistence is needed
+- corpus is small to medium
+- simple metadata queries are useful
+- single-node deployment is acceptable
+- the app should avoid external services
+
+Pros:
+
+- lightweight
+- persistent
+- supports SQL metadata filters
+- easy to test
+- easy to back up
+- works well for local tools
+
+Cons:
+
+- limited concurrent writes
+- vector search requires extensions or custom logic
+- not ideal for distributed systems
+- not ideal for high-scale multi-tenant workloads
+
+Good for:
+
+- desktop tools
+- local agents
+- internal prototypes
+- small internal tools
+
+Do not use when:
+
+- multi-instance production scaling is needed
+- high write concurrency is required
+- managed vector search is required
+
+---
+
+### PostgreSQL or Supabase
+
+Use when:
+
+- production persistence is needed
+- metadata filtering matters
+- user-scoped retrieval is required
+- organization-scoped retrieval is required
+- the project already uses Postgres
+- pgvector is acceptable for embedding search
+- SQL auditability is useful
+
+Pros:
+
+- strong metadata filtering
+- mature permission patterns
+- transactional updates
+- supports relational integrity
+- can store documents, chunks, metadata, and embeddings
+- can support vector search through pgvector
+- familiar enterprise operational model
+
+Cons:
+
+- requires schema design
+- vector performance may require tuning
+- migrations must be managed
+- operational complexity is higher than JSON or SQLite
+
+Good for:
+
+- SaaS apps
+- multi-tenant RAG
+- permission-scoped retrieval
+- production systems
+- enterprise workflows
+
+Do not use blindly when:
+
+- the user wants a no-database prototype
+- vector scale is too large for the selected Postgres setup
+- managed vector search is explicitly preferred
+
+---
+
+### Dedicated Vector Database
+
+Examples:
+
+- Pinecone
+- Qdrant
+- Weaviate
+- Chroma
+
+Use when:
+
+- embedding retrieval is central
+- corpus is large
+- vector search performance matters
+- managed scaling is useful
+- metadata filtering is supported by the selected database
+- the user accepts vendor-specific APIs
+
+Pros:
+
+- optimized vector search
+- scalable
+- often supports metadata filters
+- production-ready for semantic retrieval
+- may support namespaces or collections
+
+Cons:
+
+- external dependency
+- cost
+- vendor-specific APIs
+- migration complexity
+- keyword retrieval may still need separate storage
+- access-control behavior must be verified carefully
+
+Good for:
+
+- large semantic search systems
+- production RAG at scale
+- high-query-volume embedding retrieval
+- systems with large vector indexes
+
+Do not use blindly when:
+
+- the system is keyword-only
+- the corpus is small
+- the user wants dependency-light examples
+- permission filtering requirements are not supported by the vector database
+
+---
+
+### Redis
+
+Use when:
+
+- caching is needed
+- short-lived retrieval state is needed
+- fast lookup is important
+- another durable store exists
+- session-level retrieval artifacts are useful
+
+Pros:
+
+- fast
+- good for cache
+- useful for temporary candidate pools
+- useful for context cache
+- useful for rerank cache
+
+Cons:
+
+- not ideal as only durable storage
+- memory cost
+- persistence depends on configuration
+- not ideal for long-term source-of-truth storage
+
+Good for:
+
+- embedding cache
+- context-generation cache
+- rerank cache
+- final context cache
+- temporary retrieval state
+
+Do not use as the only store when:
+
+- source documents must be durable
+- auditability matters
+- deletion and reindexing must be traceable
+
+---
+
+## Logical Storage Architecture
+
+A modular RAG system should separate logical storage concerns even if one physical backend stores everything.
+
+Recommended logical stores:
+
+1. Document store
+2. Chunk store
+3. Contextualization store
+4. Keyword index store
+5. Embedding store
+6. Retrieval log store
+7. Cache store
+8. Evaluation store
+
+---
+
+## Document Store
+
+Stores original document-level records.
+
+Recommended fields:
+
+- document_id
+- document_name
+- source_type
+- source_uri
+- raw_text or extracted_text
+- text_hash
+- metadata
+- user_id when user-scoped
+- organization_id when organization-scoped
+- permissions when permission-scoped
+- created_at
+- updated_at
+- deleted_at when soft deletes are used
+
+Rules:
+
+- document_id must be stable
+- document metadata must be preserved
+- permission metadata must not be removed
+- raw text may be omitted only if source text can be recovered elsewhere
+- text_hash should change when source text changes
+
+---
+
+## Chunk Store
+
+Stores chunk-level records.
+
+Recommended fields:
+
+- chunk_id
+- document_id
+- chunk_index
+- text
+- token_count
+- chunking_strategy
+- metadata
+- text_hash
+- created_at
+- updated_at
+- deleted_at when soft deletes are used
+
+Rules:
+
+- chunk_id must be stable
+- chunk_id should be deterministic when possible
+- chunk must link back to document_id
+- chunk text must remain original source text
+- contextualized text should not overwrite chunk text
+- metadata must be preserved
+
+---
+
+## Contextualization Store
+
+Stores generated context and contextualized text.
+
+Recommended fields:
+
+- chunk_id
+- document_id
+- context_summary
+- contextualized_text
+- context_model
+- prompt_version
+- chunk_text_hash
+- generated_at
+- metadata
+
+Rules:
+
+- original chunk text remains in chunk store
+- contextualized text is stored separately
+- context_model is required when contextualization is enabled
+- prompt_version is required for cache invalidation
+- chunk_text_hash is required to detect stale context
+- permission metadata must be preserved
+
+---
+
+## Keyword Index Store
+
+Stores lexical retrieval artifacts.
+
+Recommended fields or structures:
+
+- tokenizer_name
+- stop_words
+- term_frequencies
+- normalized_term_frequencies
+- document_frequencies
+- inverse_document_frequencies
+- chunk_id references
+- indexed_text_type
+- index_version
+
+Rules:
+
+- indexed_text_type should identify original or contextualized text
+- keyword index should be rebuildable from chunks
+- tokenizer settings must be preserved
+- stop word policy must be preserved
+- document frequencies must match the indexed corpus
+- stale indexes must be detectable
+
+---
+
+## Embedding Store
+
+Stores vector retrieval artifacts.
+
+Recommended fields:
+
+- chunk_id
+- document_id
+- embedding_vector
+- embedding_model
+- embedding_dimension
+- embedding_provider
+- indexed_text_type
+- indexed_text_hash
+- created_at
+- metadata
+
+Rules:
+
+- do not mix embedding models in one index unless explicitly supported
+- do not mix dimensions in one index
+- do not mix original and contextualized text embeddings unless explicitly labeled
+- provider name must be preserved
+- indexed_text_type must be preserved
+- permission metadata must be preserved or filterable
+
+---
+
+## Retrieval Log Store
+
+Optionally stores retrieval observability data.
+
+Recommended fields:
+
+- query_id
+- query_text_hash
+- retrieval_config
+- strategies_used
+- filters_used
+- result_chunk_ids
+- scores
+- latency_ms
+- warnings
+- created_at
+
+Rules:
+
+- avoid logging full sensitive query text by default
+- avoid logging full context by default
+- do not log API keys
+- preserve enough information to debug retrieval quality
+- preserve enough information to audit access-control behavior
+
+---
+
+## Cache Store
+
+Caches expensive or repeated operations.
+
+Useful caches:
+
+- generated context cache
+- embedding cache
+- keyword index cache
+- rerank cache
+- final context cache
+
+Cache key components may include:
+
+- document_id
+- chunk_id
+- text hash
+- model name
+- provider name
+- prompt version
+- retrieval config version
+- indexed_text_type
+
+Rules:
+
+- cache keys must change when source text changes
+- cache keys must change when model changes
+- cache keys must change when prompt version changes
+- stale cache must not be reused silently
+- cache must not bypass permission filters
+
+---
+
+## Evaluation Store
+
+Optional but recommended for enterprise systems.
+
+Stores:
+
+- test queries
+- expected relevant chunks
+- expected source documents
+- retrieval results
+- scores
+- human judgments
+- pass/fail outcomes
+- regression history
+
+Purpose:
+
+- detect retrieval quality regressions
+- compare retrieval strategies
+- validate hybrid retrieval
+- evaluate contextual retrieval
+- evaluate reranking
+- support enterprise QA
+
+---
+
+## Storage Interfaces
+
+Use interfaces or adapters so retrieval logic is not locked to one backend.
+
+Python-style contracts:
+
+    from __future__ import annotations
+
+    from typing import Any, Protocol
+
+
+    class DocumentStore(Protocol):
+        def save_document(self, document: Any) -> None:
+            ...
+
+        def get_document(self, *, document_id: str) -> Any | None:
+            ...
+
+        def delete_document(self, *, document_id: str) -> None:
+            ...
+
+
+    class ChunkStore(Protocol):
+        def save_chunks(self, chunks: list[Any]) -> None:
+            ...
+
+        def load_chunks(self, *, filters: dict[str, Any] | None = None) -> list[Any]:
+            ...
+
+        def get_chunk(self, *, chunk_id: str) -> Any | None:
+            ...
+
+        def delete_chunks_for_document(self, *, document_id: str) -> None:
+            ...
+
+
+    class KeywordIndexStore(Protocol):
+        def save_keyword_index(self, index: Any) -> None:
+            ...
+
+        def load_keyword_index(self) -> Any:
+            ...
+
+        def delete_keyword_entries_for_document(self, *, document_id: str) -> None:
+            ...
+
+
+    class EmbeddingStore(Protocol):
+        def save_embeddings(self, embedded_chunks: list[Any]) -> None:
+            ...
+
+        def search_embeddings(
+            self,
+            *,
+            query_embedding: list[float],
+            top_k: int,
+            filters: dict[str, Any] | None = None,
+        ) -> list[Any]:
+            ...
+
+        def delete_embeddings_for_document(self, *, document_id: str) -> None:
+            ...
+
+
+    class ContextualizationStore(Protocol):
+        def save_contextualized_chunks(self, contextualized_chunks: list[Any]) -> None:
+            ...
+
+        def load_contextualized_chunks(
+            self,
+            *,
+            filters: dict[str, Any] | None = None,
+        ) -> list[Any]:
+            ...
+
+        def delete_contextualized_chunks_for_document(self, *, document_id: str) -> None:
+            ...
+
+Rules:
+
+- keep storage replaceable
+- do not mix storage code with scoring code
+- do not make retrieval functions depend on one database unless selected
+- provider-specific storage code belongs in adapters
+- storage interfaces should be easy to fake in tests
+
+---
+
+## In-Memory Store Example
+
+In-memory storage is useful for tests and examples.
+
+    class InMemoryChunkStore:
+        def __init__(self) -> None:
+            self._chunks: dict[str, Any] = {}
+
+        def save_chunks(self, chunks: list[Any]) -> None:
+            for chunk in chunks:
+                if not chunk.chunk_id:
+                    raise ValueError("chunk_id cannot be empty.")
+
+                self._chunks[chunk.chunk_id] = chunk
+
+        def load_chunks(self, *, filters: dict[str, Any] | None = None) -> list[Any]:
+            active_filters = filters or {}
+
+            chunks = list(self._chunks.values())
+
+            if not active_filters:
+                return chunks
+
+            return [
+                chunk
+                for chunk in chunks
+                if metadata_matches_filters(chunk.metadata, active_filters)
+            ]
+
+        def get_chunk(self, *, chunk_id: str) -> Any | None:
+            return self._chunks.get(chunk_id)
+
+        def delete_chunks_for_document(self, *, document_id: str) -> None:
+            chunk_ids_to_delete = [
+                chunk_id
+                for chunk_id, chunk in self._chunks.items()
+                if chunk.document_id == document_id
+            ]
+
+            for chunk_id in chunk_ids_to_delete:
+                del self._chunks[chunk_id]
+
+Rules:
+
+- good for tests
+- not durable
+- not production storage
+- should preserve metadata exactly
+
+---
+
+## Metadata Filtering
+
+Storage must support filters when retrieval is scoped.
+
+Common filters:
+
+- user_id
+- organization_id
+- document_id
+- source_type
+- tags
+- date range
+- permissions
+- access_scope
+- document_visibility
+
+Filter helper:
+
+    def metadata_matches_filters(
+        metadata: dict[str, Any],
+        filters: dict[str, Any],
+    ) -> bool:
+        for key, expected_value in filters.items():
+            actual_value = metadata.get(key)
+
+            if isinstance(expected_value, list | tuple | set):
+                if actual_value not in expected_value:
+                    return False
+            else:
+                if actual_value != expected_value:
+                    return False
+
+        return True
+
+Rules:
+
+- apply permission filters before final results
+- prefer applying filters before scoring when possible
+- do not silently ignore permission filters
+- do not retrieve across tenants
+- do not rely only on final client-side filtering for sensitive external vector stores unless explicitly accepted
+
+---
+
+## JSON Storage Shape
+
+Recommended JSON structure for small local systems:
+
+    {
+      "schema_version": "1.0",
+      "documents": [],
+      "chunks": [],
+      "contextualized_chunks": [],
+      "keyword_index": {
+        "tokenizer_name": "simple_regex_lowercase_alphanumeric",
+        "document_frequencies": {},
+        "inverse_document_frequencies": {},
+        "indexed_text_type": "original"
+      },
+      "embeddings": {
+        "provider": "voyage",
+        "model": "voyage-3-large",
+        "dimension": 1024,
+        "indexed_text_type": "original",
+        "items": []
+      }
+    }
+
+Rules:
+
+- include schema version
+- include embedding model
+- include embedding dimension
+- include provider
+- include tokenizer name
+- include indexed_text_type
+- include enough metadata to rebuild indexes
+- do not store API keys
+
+---
+
+## PostgreSQL-Style Schema Direction
+
+For production relational storage, use separate tables.
+
+Recommended tables:
+
+    documents
+    chunks
+    contextualized_chunks
+    embeddings
+    keyword_terms
+    keyword_document_frequencies
+    retrieval_logs
+    evaluation_queries
+    evaluation_results
+
+Recommended documents fields:
+
+    document_id
+    document_name
+    source_type
+    source_uri
+    text_hash
+    metadata_json
+    created_at
+    updated_at
+    deleted_at
+
+Recommended chunks fields:
+
+    chunk_id
+    document_id
+    chunk_index
+    text
+    token_count
+    chunking_strategy
+    text_hash
+    metadata_json
+    created_at
+    updated_at
+    deleted_at
+
+Recommended contextualized_chunks fields:
+
+    chunk_id
+    document_id
+    context_summary
+    contextualized_text
+    context_model
+    prompt_version
+    chunk_text_hash
+    metadata_json
+    created_at
+
+Recommended embeddings fields:
+
+    chunk_id
+    document_id
+    embedding_model
+    embedding_dimension
+    embedding_provider
+    embedding_vector
+    indexed_text_type
+    indexed_text_hash
+    metadata_json
+    created_at
+
+Recommended retrieval_logs fields:
+
+    query_id
+    query_text_hash
+    retrieval_config_json
+    strategies_used_json
+    filters_used_json
+    result_chunk_ids_json
+    score_summary_json
+    latency_ms
+    warnings_json
+    created_at
+
+Rules:
+
+- use foreign keys where appropriate
+- index metadata fields used in filters
+- separate embeddings by model
+- separate original text from contextualized text
+- do not store secrets
+- make stale indexes detectable
+
+---
+
+## Deletion and Reindexing
+
+A production storage design must handle updates.
+
+When a document changes:
+
+1. detect text hash change
+2. mark old chunks stale or delete them
+3. regenerate chunks
+4. regenerate contextualized text if enabled
+5. regenerate embeddings
+6. rebuild or update keyword index
+7. clear stale caches
+8. record update status
+
+When a document is deleted:
+
+1. delete or soft-delete document record
+2. delete associated chunks
+3. delete contextualized chunks
+4. delete embeddings
+5. remove keyword index entries
+6. remove cached context
+7. remove stale rerank cache
+8. preserve audit logs only if policy allows
+
+Do not leave orphaned chunks, embeddings, contextualized text, or keyword entries.
+
+---
+
+## Staleness Detection
+
+Storage should make stale artifacts detectable.
+
+Useful hashes:
+
+- document text hash
+- chunk text hash
+- indexed text hash
+- contextualized text hash
+- prompt version
+- embedding model
+- embedding provider
+- indexed_text_type
+
+An artifact is stale when:
+
+- source document text changed
+- chunk text changed
+- chunking strategy changed
+- contextualization prompt changed
+- contextualization model changed
+- embedding model changed
+- embedding provider changed
+- indexed_text_type changed
+
+Rules:
+
+- do not reuse stale embeddings silently
+- do not reuse stale context silently
+- do not return deleted chunks
+- do not return chunks from old document versions unless versioning is intentional
+
+---
+
+## Security Rules
+
+Never store:
+
+- API keys
+- access tokens
+- plaintext secrets
+- unrelated private documents in an unrestricted namespace
+
+Always preserve:
+
+- user_id when user-scoped
+- organization_id when organization-scoped
+- permissions when permission-scoped
+- source metadata needed for auditability
+- document_id
+- chunk_id
+
+If using external vector databases:
+
+- confirm metadata filtering supports required access controls
+- do not rely only on client-side filtering for sensitive data unless explicitly accepted
+- namespace or partition tenant data when needed
+- verify delete behavior
+- verify metadata update behavior
+- verify backup and retention policy
+
+---
+
+## Logging Rules
+
+Logs may include:
+
+- document_id
+- chunk_id
+- index version
+- model name
+- provider name
+- indexed_text_type
+- operation status
+- latency
+- cache hit or miss
+- error type
+
+Logs should not include by default:
+
+- full document text
+- full chunk text
+- full context
+- API keys
+- access tokens
+- private URLs
+- customer secrets
+
+---
+
+## Error Handling
+
+Raise clear errors for:
+
+- missing storage backend
+- unsupported storage type
+- failed persistence write
+- failed index load
+- schema version mismatch
+- embedding model mismatch
+- embedding dimension mismatch
+- embedding provider mismatch
+- indexed_text_type mismatch
+- missing chunk for embedding
+- missing document for chunk
+- stale context cache
+- stale embedding cache
+- permission filter missing in scoped retrieval
+- unsupported metadata filter
+
+Do not silently drop chunks, embeddings, contextualized text, or metadata.
+
+---
+
+## Tests
+
+A gold-standard storage implementation should test the following.
+
+### Test 1 — Chunks Save And Load
+
+Expected:
+
+- saved chunks can be loaded
+- chunk IDs are preserved
+- document IDs are preserved
+
+### Test 2 — Metadata Is Preserved
+
+Expected:
+
+- document_name remains available
+- page_number remains available
+- section_heading remains available
+- user_id remains available when present
+- organization_id remains available when present
+- permissions remain available when present
+
+### Test 3 — Filters Return Only Matching Chunks
+
+Input:
+
+    filters = {"user_id": "user_123"}
+
+Expected:
+
+- only chunks with matching user_id are returned
+
+### Test 4 — Permission Filters Are Enforced
+
+Expected:
+
+- unauthorized chunks are not returned
+
+### Test 5 — Duplicate Chunk IDs Are Handled
+
+Expected:
+
+- duplicate chunk behavior is explicit
+- either overwrite, reject, or version based on selected policy
+
+### Test 6 — Embedding Model Is Preserved
+
+Expected:
+
+- embedding_model is stored and loaded correctly
+
+### Test 7 — Embedding Dimension Is Preserved
+
+Expected:
+
+- embedding_dimension is stored and loaded correctly
+
+### Test 8 — Model Mismatch Raises Error
+
+Expected:
+
+- trying to load incompatible embeddings raises an error
+
+### Test 9 — Contextualized Text Maps To Original Chunk
+
+Expected:
+
+- contextualized record keeps chunk_id
+- original chunk remains recoverable
+
+### Test 10 — Deleted Document Removes Associated Artifacts
+
+Expected:
+
+- chunks are removed
+- embeddings are removed
+- contextualized chunks are removed
+- keyword entries are removed or rebuilt
+- caches are invalidated
+
+### Test 11 — Reindexing Replaces Stale Chunks
+
+Expected:
+
+- stale chunks are not returned
+- new chunks are indexed
+
+### Test 12 — Cache Key Changes When Text Changes
+
+Expected:
+
+- changing source text changes cache key
+
+### Test 13 — API Keys Are Never Stored
+
+Expected:
+
+- no API key appears in stored metadata
+- no API key appears in JSON files
+- no API key appears in logs
+
+### Test 14 — Schema Version Mismatch Raises Error
+
+Expected:
+
+- incompatible schema version fails clearly
+
+### Test 15 — Storage Adapters Are Replaceable
+
+Expected:
+
+- retrieval logic can use fake storage in tests
+- retrieval logic does not depend directly on one database SDK
+
+---
+
+## Bad vs Good
+
+Bad:
+
+    chunks = []
+    embeddings = []
+    # no IDs, no metadata, no persistence
+
+Why bad:
+
+- cannot trace results
+- cannot filter by user
+- cannot rebuild indexes safely
+- cannot persist across restarts
+- cannot audit retrieval behavior
+
+Bad:
+
+    vector_db.upsert(text, embedding)
+
+Why bad:
+
+- no chunk_id
+- no document_id
+- no metadata
+- no model tracking
+- no indexed_text_type
+- no access control
+- no source traceability
+
+Bad:
+
+    store_embedding(chunk_id, embedding)
+
+Why bad:
+
+- no model
+- no dimension
+- no provider
+- no metadata
+- no indexed text hash
+- no stale detection
+
+Good:
+
+    chunk_store.save_chunks(chunks)
+    contextualization_store.save_contextualized_chunks(contextualized_chunks)
+    embedding_store.save_embeddings(embedded_chunks)
+    keyword_index_store.save_keyword_index(keyword_index)
+
+Why good:
+
+- storage responsibilities are separated
+- metadata is preserved
+- artifacts are traceable
+- adapters are replaceable
+- indexes can be rebuilt
+- stale artifacts can be detected
+
+---
+
+## Acceptance Criteria
+
+A storage design is enterprise-ready only if:
+
+- storage backend is selected by the user or explicitly defaulted
+- documents have stable IDs
+- chunks have stable IDs
+- metadata is preserved
+- permission metadata is preserved
+- tenant metadata is preserved when present
+- original text is separate from contextualized text
+- embeddings track model, dimension, provider, and indexed_text_type
+- contextualized records track model and prompt version
+- keyword index settings are preserved
+- deletion behavior is defined
+- reindexing behavior is defined
+- cache invalidation is defined
+- stale artifact detection is defined
+- API keys are not stored
+- storage adapters are replaceable
+- tests cover persistence, filters, deletion, reindexing, and model mismatch
+
+---
+
+## Quality Checklist
+
+Before accepting storage design as gold standard, verify:
+
+- storage is not assumed without user selection
+- vector database is not assumed unnecessarily
+- document store is defined
+- chunk store is defined
+- contextualization store is defined when contextual retrieval is enabled
+- embedding store is defined when embedding retrieval is enabled
+- keyword index store is defined when keyword retrieval is enabled
+- metadata filters are supported
+- permission filters are supported
+- tenant boundaries are preserved
+- indexed_text_type is tracked
+- embedding model is tracked
+- embedding dimension is tracked
+- embedding provider is tracked
+- context model is tracked
+- prompt version is tracked
+- hashes exist for stale detection
+- deletion behavior is clear
+- reindexing behavior is clear
+- cache invalidation behavior is clear
+- secrets are never stored
+- logs avoid sensitive text by default
+- storage can be faked in unit tests
+- storage adapters are replaceable
+"""
+
+Path("storage_options.md").write_text(
+    storage_options_md,
+    encoding="utf-8",
+)

@@ -1,0 +1,877 @@
+# Gold Standard Keyword Retrieval Reference
+
+This file defines the expected standard for keyword-based retrieval in a modular RAG system.
+
+The default keyword retrieval method is TF-IDF.
+
+Keyword retrieval should be usable by itself or as one first-stage retriever inside a hybrid retrieval pipeline with embedding retrieval, RRF fusion, and optional reranking.
+
+---
+
+## Purpose
+
+Keyword retrieval helps retrieve chunks that contain exact or near-exact query terms.
+
+It is useful when:
+
+* the query includes names
+* the query includes IDs
+* the query includes legal terms
+* the query includes financial terms
+* the query includes error messages
+* the query includes product names
+* the query includes exact phrases
+* embeddings may blur important terminology
+
+Keyword retrieval should not be implemented as naive word counting.
+
+Naive word counting rewards repeated words and keyword stuffing.
+
+Example problem:
+
+Query:
+
+```text
+financial financial financial
+```
+
+A naive counter may over-rank any chunk repeating "financial" many times.
+
+A TF-IDF retriever should reduce this problem by considering both term frequency and term rarity.
+
+---
+
+## Required Behavior
+
+A gold-standard keyword retriever must:
+
+* tokenize query and chunk text consistently
+* normalize case
+* optionally remove stop words
+* compute term frequency
+* compute inverse document frequency
+* score chunks using TF-IDF
+* return ranked results
+* preserve metadata
+* include keyword score
+* include rank
+* include retriever name
+* return an empty list safely when there are no matches
+* avoid mutating source chunks
+* be deterministic
+
+---
+
+## Data Models
+
+This reference assumes these models exist in the core reference:
+
+* TextChunk
+* RetrievalResult
+
+Keyword retrieval also uses these keyword-specific models.
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+import math
+import re
+from collections import Counter, defaultdict
+
+
+Metadata = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TextChunk:
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RetrievalResult:
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata
+    score: float
+    score_type: str
+    rank: int
+    retriever_name: str
+
+
+@dataclass(frozen=True)
+class KeywordIndexEntry:
+    chunk: TextChunk
+    term_frequencies: dict[str, int]
+    normalized_term_frequencies: dict[str, float]
+
+
+@dataclass(frozen=True)
+class KeywordIndex:
+    entries: list[KeywordIndexEntry]
+    document_frequencies: dict[str, int]
+    inverse_document_frequencies: dict[str, float]
+    total_chunks: int
+    tokenizer_name: str
+    stop_words: set[str] = field(default_factory=set)
+```
+
+---
+
+## Tokenizer
+
+Function:
+
+```python
+tokenize_for_keyword_search()
+```
+
+Purpose:
+
+Convert raw text into normalized searchable terms.
+
+Rules:
+
+* Lowercase text.
+* Extract alphanumeric terms.
+* Remove empty tokens.
+* Remove stop words when provided.
+* Keep the same tokenizer for documents and queries.
+* Do not use a different query tokenizer unless explicitly documented.
+
+```python
+DEFAULT_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "has",
+    "he",
+    "in",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "was",
+    "were",
+    "will",
+    "with",
+}
+
+
+def tokenize_for_keyword_search(
+    text: str,
+    *,
+    stop_words: set[str] | None = None,
+) -> list[str]:
+    if not text:
+        return []
+
+    active_stop_words = stop_words or set()
+
+    terms = re.findall(r"[a-zA-Z0-9]+", text.lower())
+
+    return [term for term in terms if term and term not in active_stop_words]
+```
+
+Notes:
+
+* This tokenizer is intentionally simple and dependency-free.
+* For multilingual corpora, replace this tokenizer with a language-aware tokenizer.
+* For code retrieval, preserve symbols differently.
+* For legal or medical retrieval, define domain-specific tokenization rules.
+
+---
+
+## Term Frequency
+
+Function:
+
+```python
+calculate_term_frequencies()
+```
+
+Purpose:
+
+Count terms in a chunk.
+
+```python
+def calculate_term_frequencies(tokens: list[str]) -> dict[str, int]:
+    return dict(Counter(tokens))
+```
+
+---
+
+## Normalized Term Frequency
+
+Function:
+
+```python
+calculate_normalized_term_frequencies()
+```
+
+Purpose:
+
+Normalize term frequency so longer chunks are not unfairly rewarded.
+
+```python
+def calculate_normalized_term_frequencies(tokens: list[str]) -> dict[str, float]:
+    if not tokens:
+        return {}
+
+    counts = Counter(tokens)
+    total_terms = len(tokens)
+
+    return {
+        term: count / total_terms
+        for term, count in counts.items()
+    }
+```
+
+Rules:
+
+* Do not use raw counts alone for final ranking.
+* Normalize by chunk length unless using a more advanced ranking method.
+* Keep raw counts available for debugging if useful.
+
+---
+
+## Inverse Document Frequency
+
+Function:
+
+```python
+calculate_inverse_document_frequencies()
+```
+
+Purpose:
+
+Calculate how rare each term is across chunks.
+
+```python
+def calculate_inverse_document_frequencies(
+    document_frequencies: dict[str, int],
+    *,
+    total_chunks: int,
+) -> dict[str, float]:
+    if total_chunks <= 0:
+        raise ValueError("total_chunks must be greater than zero.")
+
+    idf: dict[str, float] = {}
+
+    for term, document_frequency in document_frequencies.items():
+        if document_frequency <= 0:
+            continue
+
+        idf[term] = math.log((1 + total_chunks) / (1 + document_frequency)) + 1
+
+    return idf
+```
+
+Rules:
+
+* Use smoothing to avoid division by zero.
+* Rare terms should receive higher weight.
+* Common terms should receive lower weight.
+* Stop words should usually be removed before IDF calculation.
+
+---
+
+## Build Keyword Index
+
+Function:
+
+```python
+build_keyword_index()
+```
+
+Purpose:
+
+Build a TF-IDF keyword index over chunks.
+
+Inputs:
+
+* chunks
+* stop_words
+* tokenizer
+
+Output:
+
+* KeywordIndex
+
+Rules:
+
+* Reject empty chunk lists.
+* Validate chunk text.
+* Preserve chunk objects.
+* Use the same tokenizer for every chunk.
+* Compute document frequency by unique terms per chunk.
+* Store both raw and normalized term frequencies.
+
+```python
+def build_keyword_index(
+    chunks: list[TextChunk],
+    *,
+    stop_words: set[str] | None = None,
+) -> KeywordIndex:
+    if not chunks:
+        raise ValueError("chunks cannot be empty.")
+
+    active_stop_words = stop_words if stop_words is not None else DEFAULT_STOP_WORDS
+
+    entries: list[KeywordIndexEntry] = []
+    document_frequencies: dict[str, int] = defaultdict(int)
+
+    for chunk in chunks:
+        if not chunk.text or not chunk.text.strip():
+            raise ValueError(f"Chunk text cannot be empty: {chunk.chunk_id}")
+
+        tokens = tokenize_for_keyword_search(
+            chunk.text,
+            stop_words=active_stop_words,
+        )
+
+        term_frequencies = calculate_term_frequencies(tokens)
+        normalized_term_frequencies = calculate_normalized_term_frequencies(tokens)
+
+        for term in set(tokens):
+            document_frequencies[term] += 1
+
+        entries.append(
+            KeywordIndexEntry(
+                chunk=chunk,
+                term_frequencies=term_frequencies,
+                normalized_term_frequencies=normalized_term_frequencies,
+            )
+        )
+
+    inverse_document_frequencies = calculate_inverse_document_frequencies(
+        dict(document_frequencies),
+        total_chunks=len(chunks),
+    )
+
+    return KeywordIndex(
+        entries=entries,
+        document_frequencies=dict(document_frequencies),
+        inverse_document_frequencies=inverse_document_frequencies,
+        total_chunks=len(chunks),
+        tokenizer_name="simple_regex_lowercase_alphanumeric",
+        stop_words=active_stop_words,
+    )
+```
+
+---
+
+## TF-IDF Score
+
+Function:
+
+```python
+score_chunk_with_tfidf()
+```
+
+Purpose:
+
+Score one chunk against query terms.
+
+```python
+def score_chunk_with_tfidf(
+    *,
+    query_terms: list[str],
+    entry: KeywordIndexEntry,
+    inverse_document_frequencies: dict[str, float],
+) -> float:
+    if not query_terms:
+        return 0.0
+
+    query_term_counts = Counter(query_terms)
+    score = 0.0
+
+    for term, query_count in query_term_counts.items():
+        tf = entry.normalized_term_frequencies.get(term, 0.0)
+        idf = inverse_document_frequencies.get(term, 0.0)
+
+        if tf <= 0 or idf <= 0:
+            continue
+
+        query_weight = 1 + math.log(query_count)
+
+        score += query_weight * tf * idf
+
+    return score
+```
+
+Rules:
+
+* Repeated query terms may increase score, but only logarithmically.
+* Repetition should not dominate ranking.
+* Missing terms should contribute zero.
+* Unknown query terms should not error.
+
+---
+
+## Keyword Search
+
+Function:
+
+```python
+keyword_search()
+```
+
+Purpose:
+
+Retrieve chunks ranked by TF-IDF keyword relevance.
+
+Inputs:
+
+* query
+* keyword index
+* top_k
+* filters
+
+Output:
+
+* list[RetrievalResult]
+
+Rules:
+
+* Reject empty query.
+* Reject invalid top_k.
+* Return empty list if no chunks match.
+* Preserve metadata.
+* Include score_type as "tf_idf".
+* Include retriever_name as "keyword_tfidf".
+* Sort by score descending.
+* Use stable tie-breaking by chunk_id.
+
+```python
+def keyword_search(
+    *,
+    query: str,
+    index: KeywordIndex,
+    top_k: int = 5,
+    filters: dict[str, Any] | None = None,
+) -> list[RetrievalResult]:
+    if not query or not query.strip():
+        raise ValueError("query cannot be empty.")
+
+    if top_k <= 0:
+        raise ValueError("top_k must be greater than zero.")
+
+    active_filters = filters or {}
+
+    query_terms = tokenize_for_keyword_search(
+        query,
+        stop_words=index.stop_words,
+    )
+
+    if not query_terms:
+        return []
+
+    scored_results: list[tuple[float, TextChunk]] = []
+
+    for entry in index.entries:
+        if not metadata_matches_filters(entry.chunk.metadata, active_filters):
+            continue
+
+        score = score_chunk_with_tfidf(
+            query_terms=query_terms,
+            entry=entry,
+            inverse_document_frequencies=index.inverse_document_frequencies,
+        )
+
+        if score > 0:
+            scored_results.append((score, entry.chunk))
+
+    scored_results.sort(
+        key=lambda item: (-item[0], item[1].chunk_id)
+    )
+
+    results: list[RetrievalResult] = []
+
+    for rank, (score, chunk) in enumerate(scored_results[:top_k], start=1):
+        results.append(
+            RetrievalResult(
+                chunk_id=chunk.chunk_id,
+                document_id=chunk.document_id,
+                text=chunk.text,
+                token_count=chunk.token_count,
+                metadata=chunk.metadata,
+                score=score,
+                score_type="tf_idf",
+                rank=rank,
+                retriever_name="keyword_tfidf",
+            )
+        )
+
+    return results
+```
+
+---
+
+## Metadata Filtering
+
+Function:
+
+```python
+metadata_matches_filters()
+```
+
+Purpose:
+
+Filter chunks before scoring or before returning results.
+
+```python
+def metadata_matches_filters(
+    metadata: dict[str, Any],
+    filters: dict[str, Any],
+) -> bool:
+    for key, expected_value in filters.items():
+        actual_value = metadata.get(key)
+
+        if isinstance(expected_value, list | tuple | set):
+            if actual_value not in expected_value:
+                return False
+        else:
+            if actual_value != expected_value:
+                return False
+
+    return True
+```
+
+Rules:
+
+* Apply permission filters before returning results.
+* Do not retrieve across user or organization boundaries when filters are required.
+* Keep filter logic explicit.
+* Do not silently ignore unknown filters in permission-sensitive systems.
+
+---
+
+## Example Usage
+
+```python
+chunks = [
+    TextChunk(
+        chunk_id="doc-1:chunk-0",
+        document_id="doc-1",
+        text="The financial report discusses revenue, cash flow, and operating margin.",
+        token_count=14,
+        metadata={
+            "document_name": "Q4 Report",
+            "page_number": 1,
+            "user_id": "user_123",
+        },
+    ),
+    TextChunk(
+        chunk_id="doc-2:chunk-0",
+        document_id="doc-2",
+        text="The onboarding guide explains account setup and password reset steps.",
+        token_count=12,
+        metadata={
+            "document_name": "Help Center",
+            "page_number": 2,
+            "user_id": "user_123",
+        },
+    ),
+]
+
+index = build_keyword_index(chunks)
+
+results = keyword_search(
+    query="financial revenue margin",
+    index=index,
+    top_k=3,
+    filters={"user_id": "user_123"},
+)
+
+for result in results:
+    print(result.rank, result.score, result.metadata["document_name"])
+```
+
+Expected behavior:
+
+* The financial report chunk should rank above the onboarding guide.
+* Scores should be deterministic.
+* Metadata should be preserved.
+* Results should include rank and score.
+
+---
+
+## Keyword Retrieval in Hybrid Search
+
+Keyword retrieval can be used as one first-stage retriever.
+
+Typical hybrid retrieval:
+
+```python
+keyword_results = keyword_search(
+    query=query,
+    index=keyword_index,
+    top_k=candidate_pool_size,
+    filters=filters,
+)
+
+embedding_results = embedding_search(
+    query=query,
+    index=embedding_index,
+    top_k=candidate_pool_size,
+    filters=filters,
+)
+
+fused_results = reciprocal_rank_fusion(
+    ranked_lists=[keyword_results, embedding_results],
+    top_k=candidate_pool_size,
+)
+
+final_results = fused_results[:top_k]
+```
+
+Rules:
+
+* Do not add raw TF-IDF scores and cosine similarity scores directly.
+* Use RRF or a documented normalization strategy.
+* Preserve each retriever's original scores.
+* Deduplicate by chunk_id.
+* Keep score provenance.
+
+---
+
+## Contextualized Keyword Retrieval
+
+When contextual retrieval preprocessing is enabled:
+
+* generate contextualized text during ingestion
+* build the keyword index over contextualized text
+* preserve the original chunk text
+* return original chunk text in final context unless requested otherwise
+
+Example structure:
+
+```python
+@dataclass(frozen=True)
+class ContextualizedKeywordIndexEntry:
+    chunk: TextChunk
+    indexed_text: str
+    context_summary: str
+    term_frequencies: dict[str, int]
+    normalized_term_frequencies: dict[str, float]
+```
+
+Rules:
+
+* Index contextualized text.
+* Return original chunk text.
+* Keep context summary available for debugging.
+* Do not replace source text with synthetic text.
+
+---
+
+## Tests
+
+A gold-standard keyword retriever should include tests for the following cases.
+
+### Test 1 — Empty Query
+
+Input:
+
+```python
+query = ""
+```
+
+Expected:
+
+```python
+ValueError
+```
+
+### Test 2 — Empty Chunks
+
+Input:
+
+```python
+chunks = []
+```
+
+Expected:
+
+```python
+ValueError
+```
+
+### Test 3 — Exact Term Match Ranks Higher
+
+Query:
+
+```text
+financial revenue
+```
+
+Expected:
+
+* chunk containing both "financial" and "revenue" ranks higher than unrelated chunks
+
+### Test 4 — Stop Words Do Not Dominate
+
+Query:
+
+```text
+the and of financial
+```
+
+Expected:
+
+* stop words are ignored
+* "financial" drives ranking
+
+### Test 5 — Repeated Query Terms Do Not Explode Score
+
+Query:
+
+```text
+financial financial financial
+```
+
+Expected:
+
+* repeated terms may slightly increase query weight
+* repeated terms should not create uncontrolled ranking inflation
+
+### Test 6 — Metadata Is Preserved
+
+Expected:
+
+* document_name remains available
+* page_number remains available
+* user_id remains available when present
+
+### Test 7 — Filters Are Applied
+
+Input:
+
+```python
+filters = {"user_id": "user_123"}
+```
+
+Expected:
+
+* only chunks with matching user_id are returned
+
+### Test 8 — No Matches Returns Empty List
+
+Query:
+
+```text
+nonexistenttermxyz
+```
+
+Expected:
+
+```python
+[]
+```
+
+### Test 9 — Stable Tie-Breaking
+
+Expected:
+
+* equal scores sort by chunk_id
+* repeated runs return the same order
+
+---
+
+## Bad vs Good
+
+Bad:
+
+```python
+def keyword_search(query, chunks):
+    return [chunk for chunk in chunks if query in chunk.text]
+```
+
+Why bad:
+
+* no tokenization
+* no ranking
+* no metadata preservation contract
+* no score
+* no top_k
+* no filters
+* no stable ordering
+
+Bad:
+
+```python
+def score(query, text):
+    return text.count(query)
+```
+
+Why bad:
+
+* only matches exact full query string
+* rewards repetition too strongly
+* fails multi-term queries
+* ignores term rarity
+* ignores chunk length
+
+Good:
+
+```python
+build_keyword_index()
+tokenize_for_keyword_search()
+calculate_inverse_document_frequencies()
+score_chunk_with_tfidf()
+keyword_search()
+metadata_matches_filters()
+```
+
+Each function has:
+
+* clear input
+* clear output
+* clear error behavior
+* deterministic ranking
+* metadata preservation
+* testable logic
+
+---
+
+## Quality Checklist
+
+Before accepting keyword retrieval as gold standard, verify:
+
+* query validation exists
+* top_k validation exists
+* chunk validation exists
+* tokenizer is shared by documents and queries
+* stop words are handled intentionally
+* term frequency is normalized
+* inverse document frequency is smoothed
+* results include score
+* results include rank
+* results include retriever_name
+* metadata is preserved
+* filters are supported
+* tie-breaking is stable
+* no raw score mixing with embeddings
+* tests cover repeated query terms
+* tests cover no-match behavior
+* tests cover metadata preservation

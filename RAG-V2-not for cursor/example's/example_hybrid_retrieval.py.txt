@@ -1,0 +1,1501 @@
+from pathlib import Path
+
+example_hybrid_retrieval_py = r'''"""
+example_hybrid_retrieval.py
+
+Enterprise-grade hybrid retrieval example.
+
+This file is intentionally self-contained and dependency-light.
+
+It demonstrates the expected output standard for a production-quality RAG helper:
+
+- clear data contracts
+- deterministic keyword retrieval
+- deterministic fake embedding retrieval
+- no external services
+- no paid APIs
+- no framework dependency
+- no hardcoded API keys
+- provider isolation through an EmbeddingClient protocol
+- input validation before indexing and retrieval
+- metadata preservation
+- permission-aware filtering
+- keyword scoring with normalized TF-IDF
+- embedding scoring with cosine similarity
+- hybrid fusion with Reciprocal Rank Fusion
+- no direct addition of incompatible raw scores
+- stable ranking and tie-breaking
+- score provenance
+- token-budget-aware context output
+- structured retrieval response
+- readable example usage
+
+This is a basic hybrid retrieval example, not a full RAG framework.
+
+It does not use LangChain, LlamaIndex, Elasticsearch, OpenSearch, a vector database,
+or a live embedding API.
+
+Production systems may replace:
+- the in-memory keyword index
+- the in-memory embedding index
+- the fake embedding client
+- the simple context builder
+
+with selected production components.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+from collections import Counter
+import hashlib
+import json
+import math
+import re
+
+
+Metadata = dict[str, Any]
+
+
+# =============================================================================
+# Data contracts
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class TextChunk:
+    """
+    Original source chunk.
+
+    Rules:
+    - text must remain original source text
+    - chunk_id must be stable
+    - document_id must be stable
+    - metadata must preserve source and permission information
+    """
+
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class KeywordIndexEntry:
+    """
+    Keyword index entry for one chunk.
+    """
+
+    chunk: TextChunk
+    terms: list[str]
+    term_frequencies: dict[str, int]
+    normalized_term_frequencies: dict[str, float]
+    metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class KeywordIndex:
+    """
+    In-memory TF-IDF keyword index.
+    """
+
+    entries: list[KeywordIndexEntry]
+    document_frequencies: dict[str, int]
+    inverse_document_frequencies: dict[str, float]
+    tokenizer_name: str
+    indexed_text_type: str = "original"
+
+
+@dataclass(frozen=True)
+class EmbeddedChunk:
+    """
+    Chunk plus embedding vector.
+    """
+
+    chunk: TextChunk
+    embedding: list[float]
+    embedding_model: str
+    embedding_dimension: int
+    provider_name: str
+    indexed_text_type: str = "original"
+    metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EmbeddingIndex:
+    """
+    In-memory embedding index.
+    """
+
+    embedded_chunks: list[EmbeddedChunk]
+    embedding_model: str
+    embedding_dimension: int
+    provider_name: str
+    indexed_text_type: str = "original"
+
+
+@dataclass(frozen=True)
+class RetrievalResult:
+    """
+    Ranked result from one first-stage retriever.
+
+    score may be:
+    - TF-IDF score
+    - cosine similarity
+    - another retriever-specific score
+
+    Do not compare raw scores across different retrievers directly.
+    """
+
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata
+    score: float
+    score_type: str
+    rank: int
+    retriever_name: str
+
+
+@dataclass(frozen=True)
+class FusedRetrievalResult:
+    """
+    Result after Reciprocal Rank Fusion.
+
+    source_results preserves the original scores and ranks from the contributing
+    retrievers.
+    """
+
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata
+    fused_score: float
+    fused_rank: int
+    source_results: list[RetrievalResult]
+    contributing_retrievers: list[str]
+
+
+@dataclass(frozen=True)
+class RetrievalResponse:
+    """
+    Structured output shape for downstream RAG steps.
+
+    Enterprise output should not return only a plain string.
+    It should preserve query, results, context, warnings, and config used.
+    """
+
+    query: str
+    results: list[FusedRetrievalResult]
+    context: str
+    result_count: int
+    warnings: list[str]
+    config_used: Metadata
+
+
+@dataclass(frozen=True)
+class HybridRetrievalConfig:
+    """
+    Query-time hybrid retrieval configuration.
+    """
+
+    top_k: int = 5
+    candidate_pool_size: int = 20
+    max_context_tokens: int = 1200
+    filters: Metadata = field(default_factory=dict)
+    keyword_retriever_name: str = "keyword_tfidf"
+    embedding_retriever_name: str = "embedding_fake"
+    fusion_method: str = "rrf"
+    rrf_k: int = 60
+    include_scores_in_context: bool = True
+    include_score_provenance_in_context: bool = True
+    min_keyword_score: float = 0.0
+
+
+# =============================================================================
+# Tokenization
+# =============================================================================
+
+
+DEFAULT_STOP_WORDS: frozenset[str] = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "has",
+        "have",
+        "how",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "this",
+        "to",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "will",
+        "with",
+    }
+)
+
+
+TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9]+")
+
+
+def normalize_text(text: str) -> str:
+    return " ".join(text.lower().strip().split())
+
+
+def tokenize_for_keyword_search(
+    text: str,
+    *,
+    stop_words: frozenset[str] = DEFAULT_STOP_WORDS,
+) -> list[str]:
+    """
+    Deterministic tokenizer for examples and tests.
+
+    Rules:
+    - lowercase text
+    - keep alphanumeric tokens
+    - remove common stop words
+    - return stable token order
+    """
+
+    if text is None:
+        raise ValueError("text cannot be None.")
+
+    normalized = text.lower()
+    tokens = TOKEN_PATTERN.findall(normalized)
+
+    return [
+        token
+        for token in tokens
+        if token and token not in stop_words
+    ]
+
+
+# =============================================================================
+# Validation helpers
+# =============================================================================
+
+
+def estimate_token_count(text: str) -> int:
+    """
+    Lightweight deterministic token estimator.
+
+    Production systems should use the tokenizer for the target model when
+    strict token limits matter.
+    """
+
+    if not text:
+        return 0
+
+    return max(1, math.ceil(len(text) / 4))
+
+
+def stable_text_hash(text: str) -> str:
+    if text is None:
+        raise ValueError("text cannot be None.")
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def validate_non_empty_string(value: str, field_name: str) -> None:
+    if not value or not value.strip():
+        raise ValueError(f"{field_name} cannot be empty.")
+
+
+def validate_text_chunk(chunk: TextChunk) -> None:
+    validate_non_empty_string(chunk.chunk_id, "chunk_id")
+    validate_non_empty_string(chunk.document_id, "document_id")
+    validate_non_empty_string(chunk.text, f"text for chunk {chunk.chunk_id}")
+
+    if chunk.token_count <= 0:
+        raise ValueError(f"token_count must be positive for chunk {chunk.chunk_id}.")
+
+    if chunk.metadata is None:
+        raise ValueError(f"metadata cannot be None for chunk {chunk.chunk_id}.")
+
+
+def validate_hybrid_retrieval_config(config: HybridRetrievalConfig) -> None:
+    if config.top_k <= 0:
+        raise ValueError("top_k must be greater than zero.")
+
+    if config.candidate_pool_size <= 0:
+        raise ValueError("candidate_pool_size must be greater than zero.")
+
+    if config.candidate_pool_size < config.top_k:
+        raise ValueError("candidate_pool_size must be greater than or equal to top_k.")
+
+    if config.max_context_tokens <= 0:
+        raise ValueError("max_context_tokens must be greater than zero.")
+
+    if config.rrf_k <= 0:
+        raise ValueError("rrf_k must be greater than zero.")
+
+    if config.fusion_method != "rrf":
+        raise ValueError("This example supports only fusion_method='rrf'.")
+
+    if config.min_keyword_score < 0:
+        raise ValueError("min_keyword_score cannot be negative.")
+
+    validate_non_empty_string(config.keyword_retriever_name, "keyword_retriever_name")
+    validate_non_empty_string(config.embedding_retriever_name, "embedding_retriever_name")
+
+
+# =============================================================================
+# Metadata filtering
+# =============================================================================
+
+
+def metadata_matches_filters(
+    metadata: Metadata,
+    filters: Metadata,
+) -> bool:
+    """
+    Exact metadata filter helper.
+
+    Enterprise note:
+    - apply user_id, organization_id, and permission filters before returning
+      results
+    - do not silently ignore permission filters
+    - external search/vector systems should apply filters server-side when possible
+    """
+
+    for key, expected_value in filters.items():
+        actual_value = metadata.get(key)
+
+        if isinstance(expected_value, (list, tuple, set)):
+            if actual_value not in expected_value:
+                return False
+        else:
+            if actual_value != expected_value:
+                return False
+
+    return True
+
+
+# =============================================================================
+# Keyword retrieval
+# =============================================================================
+
+
+def calculate_term_frequencies(tokens: list[str]) -> dict[str, int]:
+    if not tokens:
+        return {}
+
+    return dict(Counter(tokens))
+
+
+def calculate_normalized_term_frequencies(tokens: list[str]) -> dict[str, float]:
+    if not tokens:
+        return {}
+
+    total_terms = len(tokens)
+    raw_counts = calculate_term_frequencies(tokens)
+
+    return {
+        term: count / total_terms
+        for term, count in raw_counts.items()
+    }
+
+
+def calculate_document_frequencies(
+    entries: list[KeywordIndexEntry],
+) -> dict[str, int]:
+    document_frequencies: dict[str, int] = {}
+
+    for entry in entries:
+        for term in set(entry.terms):
+            document_frequencies[term] = document_frequencies.get(term, 0) + 1
+
+    return document_frequencies
+
+
+def calculate_inverse_document_frequencies(
+    *,
+    document_frequencies: dict[str, int],
+    total_documents: int,
+) -> dict[str, float]:
+    """
+    Smooth IDF.
+
+    Formula:
+        idf = log((1 + total_documents) / (1 + document_frequency)) + 1
+    """
+
+    if total_documents <= 0:
+        raise ValueError("total_documents must be greater than zero.")
+
+    return {
+        term: math.log((1 + total_documents) / (1 + frequency)) + 1.0
+        for term, frequency in document_frequencies.items()
+    }
+
+
+def build_keyword_index(
+    chunks: list[TextChunk],
+    *,
+    indexed_text_type: str = "original",
+    tokenizer_name: str = "simple_regex_lowercase_alphanumeric",
+) -> KeywordIndex:
+    """
+    Build an in-memory keyword index.
+
+    Rules:
+    - validate chunks
+    - preserve original chunk text
+    - preserve metadata
+    - tokenize deterministically
+    - compute normalized term frequencies
+    - compute document frequencies
+    - compute inverse document frequencies
+    """
+
+    if not chunks:
+        raise ValueError("chunks cannot be empty.")
+
+    validate_non_empty_string(indexed_text_type, "indexed_text_type")
+    validate_non_empty_string(tokenizer_name, "tokenizer_name")
+
+    entries: list[KeywordIndexEntry] = []
+
+    for chunk in chunks:
+        validate_text_chunk(chunk)
+
+        terms = tokenize_for_keyword_search(chunk.text)
+
+        entries.append(
+            KeywordIndexEntry(
+                chunk=chunk,
+                terms=terms,
+                term_frequencies=calculate_term_frequencies(terms),
+                normalized_term_frequencies=calculate_normalized_term_frequencies(terms),
+                metadata={
+                    **chunk.metadata,
+                    "indexed_text_type": indexed_text_type,
+                    "tokenizer_name": tokenizer_name,
+                },
+            )
+        )
+
+    document_frequencies = calculate_document_frequencies(entries)
+
+    inverse_document_frequencies = calculate_inverse_document_frequencies(
+        document_frequencies=document_frequencies,
+        total_documents=len(entries),
+    )
+
+    return KeywordIndex(
+        entries=entries,
+        document_frequencies=document_frequencies,
+        inverse_document_frequencies=inverse_document_frequencies,
+        tokenizer_name=tokenizer_name,
+        indexed_text_type=indexed_text_type,
+    )
+
+
+def score_entry_with_tfidf(
+    *,
+    query_terms: list[str],
+    entry: KeywordIndexEntry,
+    inverse_document_frequencies: dict[str, float],
+) -> float:
+    """
+    Score one chunk against query terms using normalized TF-IDF.
+
+    Rules:
+    - use unique query terms to avoid repeated query terms exploding the score
+    - use normalized term frequency so long chunks do not dominate unfairly
+    - use IDF to reduce the impact of corpus-wide common terms
+    """
+
+    if not query_terms:
+        return 0.0
+
+    score = 0.0
+
+    for term in sorted(set(query_terms)):
+        term_frequency = entry.normalized_term_frequencies.get(term, 0.0)
+        inverse_document_frequency = inverse_document_frequencies.get(term, 0.0)
+
+        score += term_frequency * inverse_document_frequency
+
+    return score
+
+
+def keyword_search(
+    *,
+    query: str,
+    index: KeywordIndex,
+    top_k: int,
+    filters: Metadata,
+    retriever_name: str,
+    min_score: float = 0.0,
+) -> list[RetrievalResult]:
+    validate_non_empty_string(query, "query")
+    validate_non_empty_string(retriever_name, "retriever_name")
+
+    if top_k <= 0:
+        raise ValueError("top_k must be greater than zero.")
+
+    if min_score < 0:
+        raise ValueError("min_score cannot be negative.")
+
+    query_terms = tokenize_for_keyword_search(query)
+
+    if not query_terms:
+        return []
+
+    scored_entries: list[tuple[float, KeywordIndexEntry]] = []
+
+    for entry in index.entries:
+        if not metadata_matches_filters(entry.chunk.metadata, filters):
+            continue
+
+        score = score_entry_with_tfidf(
+            query_terms=query_terms,
+            entry=entry,
+            inverse_document_frequencies=index.inverse_document_frequencies,
+        )
+
+        if score <= min_score:
+            continue
+
+        scored_entries.append((score, entry))
+
+    scored_entries.sort(
+        key=lambda item: (-item[0], item[1].chunk.chunk_id)
+    )
+
+    results: list[RetrievalResult] = []
+
+    for rank, (score, entry) in enumerate(scored_entries[:top_k], start=1):
+        chunk = entry.chunk
+
+        results.append(
+            RetrievalResult(
+                chunk_id=chunk.chunk_id,
+                document_id=chunk.document_id,
+                text=chunk.text,
+                token_count=chunk.token_count,
+                metadata={
+                    **chunk.metadata,
+                    "indexed_text_type": index.indexed_text_type,
+                    "tokenizer_name": index.tokenizer_name,
+                },
+                score=score,
+                score_type="tf_idf",
+                rank=rank,
+                retriever_name=retriever_name,
+            )
+        )
+
+    return results
+
+
+# =============================================================================
+# Embedding retrieval
+# =============================================================================
+
+
+class EmbeddingClient(Protocol):
+    """
+    Provider interface.
+
+    This example uses FakeEmbeddingClient.
+    A production implementation can add VoyageEmbeddingClient behind this protocol.
+    """
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        ...
+
+    def embed_query(self, query: str) -> list[float]:
+        ...
+
+
+class FakeEmbeddingClient:
+    """
+    Deterministic fake embedding client.
+
+    This is for examples and unit tests only.
+    It maps text into a small concept vector so ranking behavior is predictable.
+    """
+
+    _concepts: tuple[tuple[str, tuple[str, ...]], ...] = (
+        (
+            "finance",
+            (
+                "financial",
+                "finance",
+                "revenue",
+                "profit",
+                "margin",
+                "earnings",
+                "sales",
+                "operating",
+                "cost",
+                "income",
+                "q4",
+            ),
+        ),
+        (
+            "account_access",
+            (
+                "password",
+                "login",
+                "account",
+                "reset",
+                "authentication",
+                "security",
+                "credentials",
+                "sign",
+                "email",
+            ),
+        ),
+        (
+            "contracts",
+            (
+                "contract",
+                "contracts",
+                "agreement",
+                "termination",
+                "renewal",
+                "clause",
+                "legal",
+                "liability",
+                "terms",
+            ),
+        ),
+        (
+            "customer_success",
+            (
+                "customer",
+                "customers",
+                "onboarding",
+                "support",
+                "ticket",
+                "success",
+                "implementation",
+                "training",
+            ),
+        ),
+        (
+            "infrastructure",
+            (
+                "infrastructure",
+                "server",
+                "database",
+                "latency",
+                "deployment",
+                "cloud",
+                "compute",
+                "storage",
+                "replicas",
+            ),
+        ),
+    )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            raise ValueError("texts cannot be empty.")
+
+        return [self._embed(text) for text in texts]
+
+    def embed_query(self, query: str) -> list[float]:
+        validate_non_empty_string(query, "query")
+        return self._embed(query)
+
+    def _embed(self, text: str) -> list[float]:
+        normalized = normalize_text(text)
+
+        vector: list[float] = []
+
+        for _, terms in self._concepts:
+            score = 0.0
+
+            for term in terms:
+                if term in normalized:
+                    score += 1.0
+
+            vector.append(score)
+
+        vector.append(min(len(normalized) / 500.0, 1.0))
+
+        return vector
+
+
+def validate_embedding_vector(vector: list[float]) -> None:
+    if not vector:
+        raise ValueError("Embedding vector cannot be empty.")
+
+    for value in vector:
+        if not isinstance(value, (int, float)):
+            raise ValueError("Embedding vector must contain only numeric values.")
+
+        if math.isnan(value) or math.isinf(value):
+            raise ValueError("Embedding vector cannot contain NaN or infinity.")
+
+
+def validate_embedding_dimensions(embeddings: list[list[float]]) -> int:
+    if not embeddings:
+        raise ValueError("embeddings cannot be empty.")
+
+    first_dimension = len(embeddings[0])
+
+    if first_dimension <= 0:
+        raise ValueError("embedding dimension must be greater than zero.")
+
+    for embedding in embeddings:
+        validate_embedding_vector(embedding)
+
+        if len(embedding) != first_dimension:
+            raise ValueError("All embeddings must have the same dimension.")
+
+    return first_dimension
+
+
+def embed_chunks(
+    *,
+    chunks: list[TextChunk],
+    embedding_client: EmbeddingClient,
+    embedding_model: str,
+    provider_name: str,
+    indexed_text_type: str = "original",
+) -> list[EmbeddedChunk]:
+    if not chunks:
+        raise ValueError("chunks cannot be empty.")
+
+    validate_non_empty_string(embedding_model, "embedding_model")
+    validate_non_empty_string(provider_name, "provider_name")
+    validate_non_empty_string(indexed_text_type, "indexed_text_type")
+
+    texts: list[str] = []
+
+    for chunk in chunks:
+        validate_text_chunk(chunk)
+        texts.append(chunk.text)
+
+    embeddings = embedding_client.embed_documents(texts)
+
+    if len(embeddings) != len(chunks):
+        raise RuntimeError(
+            f"Embedding count mismatch. Expected {len(chunks)}, got {len(embeddings)}."
+        )
+
+    embedding_dimension = validate_embedding_dimensions(embeddings)
+
+    embedded_chunks: list[EmbeddedChunk] = []
+
+    for chunk, embedding in zip(chunks, embeddings):
+        embedded_chunks.append(
+            EmbeddedChunk(
+                chunk=chunk,
+                embedding=embedding,
+                embedding_model=embedding_model,
+                embedding_dimension=embedding_dimension,
+                provider_name=provider_name,
+                indexed_text_type=indexed_text_type,
+                metadata={
+                    **chunk.metadata,
+                    "embedding_model": embedding_model,
+                    "embedding_dimension": embedding_dimension,
+                    "embedding_provider": provider_name,
+                    "indexed_text_type": indexed_text_type,
+                    "indexed_text_hash": stable_text_hash(chunk.text),
+                },
+            )
+        )
+
+    return embedded_chunks
+
+
+def build_embedding_index(
+    *,
+    embedded_chunks: list[EmbeddedChunk],
+    embedding_model: str,
+    provider_name: str,
+    indexed_text_type: str = "original",
+) -> EmbeddingIndex:
+    if not embedded_chunks:
+        raise ValueError("embedded_chunks cannot be empty.")
+
+    validate_non_empty_string(embedding_model, "embedding_model")
+    validate_non_empty_string(provider_name, "provider_name")
+    validate_non_empty_string(indexed_text_type, "indexed_text_type")
+
+    first_dimension = embedded_chunks[0].embedding_dimension
+
+    if first_dimension <= 0:
+        raise ValueError("embedding dimension must be greater than zero.")
+
+    for item in embedded_chunks:
+        validate_embedding_vector(item.embedding)
+
+        if len(item.embedding) != first_dimension:
+            raise ValueError(
+                f"Vector length mismatch for chunk {item.chunk.chunk_id}."
+            )
+
+        if item.embedding_dimension != first_dimension:
+            raise ValueError(
+                f"Embedding dimension mismatch for chunk {item.chunk.chunk_id}."
+            )
+
+        if item.embedding_model != embedding_model:
+            raise ValueError(
+                f"Embedding model mismatch for chunk {item.chunk.chunk_id}."
+            )
+
+        if item.provider_name != provider_name:
+            raise ValueError(
+                f"Embedding provider mismatch for chunk {item.chunk.chunk_id}."
+            )
+
+        if item.indexed_text_type != indexed_text_type:
+            raise ValueError(
+                f"Indexed text type mismatch for chunk {item.chunk.chunk_id}."
+            )
+
+    return EmbeddingIndex(
+        embedded_chunks=embedded_chunks,
+        embedding_model=embedding_model,
+        embedding_dimension=first_dimension,
+        provider_name=provider_name,
+        indexed_text_type=indexed_text_type,
+    )
+
+
+def cosine_similarity(vector_a: list[float], vector_b: list[float]) -> float:
+    validate_embedding_vector(vector_a)
+    validate_embedding_vector(vector_b)
+
+    if len(vector_a) != len(vector_b):
+        raise ValueError("Vectors must have the same dimension.")
+
+    dot_product = sum(a * b for a, b in zip(vector_a, vector_b))
+    magnitude_a = math.sqrt(sum(a * a for a in vector_a))
+    magnitude_b = math.sqrt(sum(b * b for b in vector_b))
+
+    if magnitude_a == 0 or magnitude_b == 0:
+        return 0.0
+
+    return dot_product / (magnitude_a * magnitude_b)
+
+
+def embedding_search(
+    *,
+    query: str,
+    index: EmbeddingIndex,
+    embedding_client: EmbeddingClient,
+    top_k: int,
+    filters: Metadata,
+    retriever_name: str,
+) -> list[RetrievalResult]:
+    validate_non_empty_string(query, "query")
+    validate_non_empty_string(retriever_name, "retriever_name")
+
+    if top_k <= 0:
+        raise ValueError("top_k must be greater than zero.")
+
+    if not index.embedded_chunks:
+        return []
+
+    query_embedding = embedding_client.embed_query(query)
+
+    validate_embedding_vector(query_embedding)
+
+    if len(query_embedding) != index.embedding_dimension:
+        raise ValueError(
+            "Query embedding dimension does not match index embedding dimension."
+        )
+
+    scored_results: list[tuple[float, EmbeddedChunk]] = []
+
+    for item in index.embedded_chunks:
+        chunk = item.chunk
+
+        if not metadata_matches_filters(chunk.metadata, filters):
+            continue
+
+        score = cosine_similarity(query_embedding, item.embedding)
+        scored_results.append((score, item))
+
+    scored_results.sort(
+        key=lambda item: (-item[0], item[1].chunk.chunk_id)
+    )
+
+    results: list[RetrievalResult] = []
+
+    for rank, (score, item) in enumerate(scored_results[:top_k], start=1):
+        chunk = item.chunk
+
+        results.append(
+            RetrievalResult(
+                chunk_id=chunk.chunk_id,
+                document_id=chunk.document_id,
+                text=chunk.text,
+                token_count=chunk.token_count,
+                metadata={
+                    **chunk.metadata,
+                    "embedding_model": index.embedding_model,
+                    "embedding_provider": index.provider_name,
+                    "embedding_dimension": index.embedding_dimension,
+                    "indexed_text_type": index.indexed_text_type,
+                },
+                score=score,
+                score_type="cosine_similarity",
+                rank=rank,
+                retriever_name=retriever_name,
+            )
+        )
+
+    return results
+
+
+# =============================================================================
+# Fusion
+# =============================================================================
+
+
+def reciprocal_rank_fusion(
+    *,
+    ranked_lists: list[list[RetrievalResult]],
+    top_k: int,
+    rrf_k: int = 60,
+) -> list[FusedRetrievalResult]:
+    """
+    Reciprocal Rank Fusion.
+
+    This is the safe default for hybrid retrieval because it combines rank
+    positions instead of directly adding incompatible raw scores.
+
+    Formula:
+        fused_score = sum(1 / (rrf_k + rank_position))
+
+    Rules:
+    - deduplicate by chunk_id
+    - preserve source results
+    - preserve contributing retrievers
+    - stable tie-break by chunk_id
+    """
+
+    if top_k <= 0:
+        raise ValueError("top_k must be greater than zero.")
+
+    if rrf_k <= 0:
+        raise ValueError("rrf_k must be greater than zero.")
+
+    if not ranked_lists:
+        return []
+
+    fused_scores: dict[str, float] = {}
+    source_results: dict[str, list[RetrievalResult]] = {}
+    representative_results: dict[str, RetrievalResult] = {}
+
+    for ranked_list in ranked_lists:
+        for position, result in enumerate(ranked_list, start=1):
+            validate_non_empty_string(result.chunk_id, "result.chunk_id")
+
+            fused_scores[result.chunk_id] = fused_scores.get(result.chunk_id, 0.0) + (
+                1.0 / (rrf_k + position)
+            )
+
+            source_results.setdefault(result.chunk_id, []).append(result)
+
+            if result.chunk_id not in representative_results:
+                representative_results[result.chunk_id] = result
+
+    sorted_chunk_ids = sorted(
+        fused_scores.keys(),
+        key=lambda chunk_id: (-fused_scores[chunk_id], chunk_id),
+    )
+
+    fused_results: list[FusedRetrievalResult] = []
+
+    for fused_rank, chunk_id in enumerate(sorted_chunk_ids[:top_k], start=1):
+        representative = representative_results[chunk_id]
+        sources = source_results[chunk_id]
+
+        contributing_retrievers = sorted(
+            {source.retriever_name for source in sources}
+        )
+
+        fused_results.append(
+            FusedRetrievalResult(
+                chunk_id=representative.chunk_id,
+                document_id=representative.document_id,
+                text=representative.text,
+                token_count=representative.token_count,
+                metadata=representative.metadata,
+                fused_score=fused_scores[chunk_id],
+                fused_rank=fused_rank,
+                source_results=sources,
+                contributing_retrievers=contributing_retrievers,
+            )
+        )
+
+    return fused_results
+
+
+# =============================================================================
+# Context output
+# =============================================================================
+
+
+def build_score_provenance_summary(result: FusedRetrievalResult) -> list[dict[str, Any]]:
+    return [
+        {
+            "retriever_name": source.retriever_name,
+            "rank": source.rank,
+            "score": round(source.score, 6),
+            "score_type": source.score_type,
+        }
+        for source in sorted(
+            result.source_results,
+            key=lambda source: (source.retriever_name, source.rank, source.chunk_id),
+        )
+    ]
+
+
+def format_fused_result_for_context(
+    *,
+    result: FusedRetrievalResult,
+    include_scores: bool,
+    include_score_provenance: bool,
+) -> str:
+    document_name = result.metadata.get("document_name", "unknown")
+    page_number = result.metadata.get("page_number")
+    section_heading = result.metadata.get("section_heading")
+
+    header_parts = [
+        f"Source: {document_name}",
+        f"Chunk: {result.chunk_id}",
+    ]
+
+    if page_number is not None:
+        header_parts.append(f"Page: {page_number}")
+
+    if section_heading:
+        header_parts.append(f"Section: {section_heading}")
+
+    if include_scores:
+        header_parts.append(f"fused_score: {result.fused_score:.6f}")
+        header_parts.append(f"Fused Rank: {result.fused_rank}")
+        header_parts.append(
+            f"Retrievers: {', '.join(result.contributing_retrievers)}"
+        )
+
+    header = f"[{' | '.join(header_parts)}]"
+
+    if not include_score_provenance:
+        return f"{header}\n{result.text.strip()}"
+
+    provenance_lines = [
+        "Score provenance:"
+    ]
+
+    for item in build_score_provenance_summary(result):
+        provenance_lines.append(
+            f"- {item['retriever_name']}: "
+            f"rank={item['rank']}, "
+            f"{item['score_type']}={item['score']}"
+        )
+
+    provenance = "\n".join(provenance_lines)
+
+    return f"{header}\n{result.text.strip()}\n\n{provenance}"
+
+
+def build_context_block(
+    *,
+    results: list[FusedRetrievalResult],
+    max_context_tokens: int,
+    include_scores: bool = True,
+    include_score_provenance: bool = True,
+) -> tuple[str, list[str]]:
+    """
+    Build a simple token-budget-aware context block.
+
+    This is intentionally small because this file focuses on hybrid retrieval.
+    A full enterprise context builder should live in contextbuilding.md.
+    """
+
+    if max_context_tokens <= 0:
+        raise ValueError("max_context_tokens must be greater than zero.")
+
+    blocks: list[str] = []
+    warnings: list[str] = []
+    used_tokens = 0
+    seen_chunk_ids: set[str] = set()
+
+    for result in results:
+        if result.chunk_id in seen_chunk_ids:
+            warnings.append(f"Skipped duplicate chunk: {result.chunk_id}")
+            continue
+
+        block = format_fused_result_for_context(
+            result=result,
+            include_scores=include_scores,
+            include_score_provenance=include_score_provenance,
+        )
+
+        block_tokens = estimate_token_count(block)
+
+        if used_tokens + block_tokens > max_context_tokens:
+            warnings.append(
+                f"Skipped chunk {result.chunk_id} because it would exceed max_context_tokens."
+            )
+            continue
+
+        blocks.append(block)
+        seen_chunk_ids.add(result.chunk_id)
+        used_tokens += block_tokens
+
+    if not blocks:
+        warnings.append("No context blocks were included.")
+
+    return "\n\n---\n\n".join(blocks), warnings
+
+
+# =============================================================================
+# Orchestration
+# =============================================================================
+
+
+def retrieve_context_for_query(
+    *,
+    query: str,
+    chunks: list[TextChunk],
+    embedding_client: EmbeddingClient,
+    embedding_model: str,
+    provider_name: str,
+    config: HybridRetrievalConfig,
+    indexed_text_type: str = "original",
+) -> RetrievalResponse:
+    """
+    End-to-end basic hybrid retrieval helper.
+
+    This is the preferred output style for examples:
+    - validate
+    - build keyword index
+    - build embedding index
+    - retrieve keyword candidates
+    - retrieve embedding candidates
+    - fuse with RRF
+    - build context
+    - return structured response
+
+    Critical rule:
+    - do not directly add keyword scores and embedding scores
+    """
+
+    validate_non_empty_string(query, "query")
+    validate_hybrid_retrieval_config(config)
+
+    keyword_index = build_keyword_index(
+        chunks,
+        indexed_text_type=indexed_text_type,
+    )
+
+    embedded_chunks = embed_chunks(
+        chunks=chunks,
+        embedding_client=embedding_client,
+        embedding_model=embedding_model,
+        provider_name=provider_name,
+        indexed_text_type=indexed_text_type,
+    )
+
+    embedding_index = build_embedding_index(
+        embedded_chunks=embedded_chunks,
+        embedding_model=embedding_model,
+        provider_name=provider_name,
+        indexed_text_type=indexed_text_type,
+    )
+
+    keyword_results = keyword_search(
+        query=query,
+        index=keyword_index,
+        top_k=config.candidate_pool_size,
+        filters=config.filters,
+        retriever_name=config.keyword_retriever_name,
+        min_score=config.min_keyword_score,
+    )
+
+    embedding_results = embedding_search(
+        query=query,
+        index=embedding_index,
+        embedding_client=embedding_client,
+        top_k=config.candidate_pool_size,
+        filters=config.filters,
+        retriever_name=config.embedding_retriever_name,
+    )
+
+    fused_results = reciprocal_rank_fusion(
+        ranked_lists=[keyword_results, embedding_results],
+        top_k=config.candidate_pool_size,
+        rrf_k=config.rrf_k,
+    )
+
+    final_results = fused_results[: config.top_k]
+
+    context, warnings = build_context_block(
+        results=final_results,
+        max_context_tokens=config.max_context_tokens,
+        include_scores=config.include_scores_in_context,
+        include_score_provenance=config.include_score_provenance_in_context,
+    )
+
+    if not keyword_results:
+        warnings.append("Keyword retriever returned no results.")
+
+    if not embedding_results:
+        warnings.append("Embedding retriever returned no results.")
+
+    if not fused_results:
+        warnings.append("Fusion returned no results.")
+
+    return RetrievalResponse(
+        query=query,
+        results=final_results,
+        context=context,
+        result_count=len(final_results),
+        warnings=warnings,
+        config_used={
+            "top_k": config.top_k,
+            "candidate_pool_size": config.candidate_pool_size,
+            "max_context_tokens": config.max_context_tokens,
+            "filters": config.filters,
+            "keyword_retriever_name": config.keyword_retriever_name,
+            "embedding_retriever_name": config.embedding_retriever_name,
+            "fusion_method": config.fusion_method,
+            "rrf_k": config.rrf_k,
+            "embedding_model": embedding_model,
+            "embedding_provider": provider_name,
+            "indexed_text_type": indexed_text_type,
+            "score_rule": "RRF over ranks; raw TF-IDF and cosine scores are not directly added.",
+        },
+    )
+
+
+# =============================================================================
+# Demo data
+# =============================================================================
+
+
+def make_demo_chunks() -> list[TextChunk]:
+    """
+    Demo corpus.
+
+    Metadata intentionally includes user_id and organization_id so the example
+    demonstrates permission-aware filtering.
+    """
+
+    raw_chunks = [
+        {
+            "chunk_id": "q4-report:chunk-001",
+            "document_id": "q4-report",
+            "text": (
+                "Revenue increased by 18% in Q4 as enterprise customers expanded "
+                "their annual contracts and operating margin improved."
+            ),
+            "metadata": {
+                "document_name": "Q4 Financial Report",
+                "page_number": 4,
+                "section_heading": "Financial Performance",
+                "user_id": "user_123",
+                "organization_id": "org_abc",
+                "source_type": "pdf",
+            },
+        },
+        {
+            "chunk_id": "help-center:chunk-001",
+            "document_id": "help-center",
+            "text": (
+                "Users can reset their password from the account security page "
+                "after verifying their email address."
+            ),
+            "metadata": {
+                "document_name": "Help Center Article",
+                "page_number": 1,
+                "section_heading": "Password Reset",
+                "user_id": "user_123",
+                "organization_id": "org_abc",
+                "source_type": "html",
+            },
+        },
+        {
+            "chunk_id": "msa:chunk-001",
+            "document_id": "msa",
+            "text": (
+                "The customer agreement renews annually unless either party sends "
+                "a termination notice before the renewal date."
+            ),
+            "metadata": {
+                "document_name": "Master Services Agreement",
+                "page_number": 9,
+                "section_heading": "Renewal and Termination",
+                "user_id": "user_123",
+                "organization_id": "org_abc",
+                "source_type": "docx",
+            },
+        },
+        {
+            "chunk_id": "customer-success:chunk-001",
+            "document_id": "customer-success",
+            "text": (
+                "Enterprise onboarding improved after the customer success team "
+                "introduced implementation training and weekly support reviews."
+            ),
+            "metadata": {
+                "document_name": "Customer Success Review",
+                "page_number": 3,
+                "section_heading": "Enterprise Onboarding",
+                "user_id": "user_123",
+                "organization_id": "org_abc",
+                "source_type": "md",
+            },
+        },
+        {
+            "chunk_id": "infra-plan:chunk-001",
+            "document_id": "infra-plan",
+            "text": (
+                "Database latency decreased after the infrastructure team moved "
+                "read-heavy workloads to dedicated replicas."
+            ),
+            "metadata": {
+                "document_name": "Infrastructure Plan",
+                "page_number": 2,
+                "section_heading": "Database Performance",
+                "user_id": "user_999",
+                "organization_id": "org_other",
+                "source_type": "md",
+            },
+        },
+    ]
+
+    chunks: list[TextChunk] = []
+
+    for item in raw_chunks:
+        text = item["text"]
+
+        chunks.append(
+            TextChunk(
+                chunk_id=item["chunk_id"],
+                document_id=item["document_id"],
+                text=text,
+                token_count=estimate_token_count(text),
+                metadata=item["metadata"],
+            )
+        )
+
+    return chunks
+
+
+# =============================================================================
+# Example run
+# =============================================================================
+
+
+def main() -> None:
+    chunks = make_demo_chunks()
+
+    embedding_client = FakeEmbeddingClient()
+
+    config = HybridRetrievalConfig(
+        top_k=3,
+        candidate_pool_size=10,
+        max_context_tokens=1200,
+        filters={
+            "user_id": "user_123",
+            "organization_id": "org_abc",
+        },
+        keyword_retriever_name="keyword_tfidf",
+        embedding_retriever_name="embedding_fake",
+        fusion_method="rrf",
+        rrf_k=60,
+        include_scores_in_context=True,
+        include_score_provenance_in_context=True,
+        min_keyword_score=0.0,
+    )
+
+    response = retrieve_context_for_query(
+        query="How did enterprise financial performance improve?",
+        chunks=chunks,
+        embedding_client=embedding_client,
+        embedding_model="fake-concept-embedding-v1",
+        provider_name="fake",
+        config=config,
+        indexed_text_type="original",
+    )
+
+    print("HYBRID RETRIEVAL RESPONSE")
+    print("=========================")
+    print(
+        json.dumps(
+            {
+                "query": response.query,
+                "result_count": response.result_count,
+                "results": [
+                    {
+                        "fused_rank": result.fused_rank,
+                        "chunk_id": result.chunk_id,
+                        "document_id": result.document_id,
+                        "fused_score": round(result.fused_score, 6),
+                        "contributing_retrievers": result.contributing_retrievers,
+                        "source_scores": build_score_provenance_summary(result),
+                        "document_name": result.metadata.get("document_name"),
+                    }
+                    for result in response.results
+                ],
+                "warnings": response.warnings,
+                "config_used": response.config_used,
+            },
+            indent=2,
+        )
+    )
+
+    print("\nCONTEXT")
+    print("=======")
+    print(response.context)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+output_path = Path("example_hybrid_retrieval.py")
+
+if output_path.exists():
+    raise FileExistsError(
+        "example_hybrid_retrieval.py already exists. "
+        "This script will not overwrite it. "
+        "Delete or rename the existing file if you intentionally want to recreate it."
+    )
+
+output_path.write_text(
+    example_hybrid_retrieval_py,
+    encoding="utf-8",
+)

@@ -1,0 +1,985 @@
+from pathlib import Path
+
+example_basic_embedding_retrieval_py = r'''"""
+example_basic_embedding_retrieval.py
+
+Enterprise-grade basic embedding retrieval example.
+
+This file is intentionally self-contained and dependency-light.
+
+It demonstrates the output standard expected from a production-quality RAG helper:
+
+- clear data contracts
+- no hardcoded API keys
+- provider isolation through an EmbeddingClient protocol
+- deterministic fake embeddings for local tests and examples
+- input validation before expensive operations
+- metadata preservation
+- permission-aware filtering
+- embedding dimension validation
+- cosine similarity ranking
+- stable tie-breaking
+- structured retrieval results
+- token-budget-aware context output
+- readable example usage
+
+This is a basic embedding retrieval example, not a full RAG framework.
+
+It does not use LangChain, LlamaIndex, a vector database, or a live embedding API.
+A real provider such as Voyage should be added behind the EmbeddingClient protocol.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+import hashlib
+import math
+import json
+
+
+Metadata = dict[str, Any]
+
+
+# =============================================================================
+# Data contracts
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class TextChunk:
+    """
+    Original source chunk.
+
+    Rules:
+    - text must remain original source text
+    - chunk_id must be stable
+    - document_id must be stable
+    - metadata must preserve source and permission information
+    """
+
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EmbeddedChunk:
+    """
+    Chunk plus embedding vector.
+
+    Rules:
+    - keep the original TextChunk intact
+    - record embedding model
+    - record embedding provider
+    - record embedding dimension
+    - record whether the indexed text was original or contextualized
+    """
+
+    chunk: TextChunk
+    embedding: list[float]
+    embedding_model: str
+    embedding_dimension: int
+    provider_name: str
+    indexed_text_type: str = "original"
+    metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EmbeddingIndex:
+    """
+    In-memory embedding index.
+
+    This example uses a simple in-memory index for clarity.
+    Production systems may replace this with PostgreSQL/pgvector, Qdrant,
+    Pinecone, Weaviate, Chroma, or another selected backend.
+    """
+
+    embedded_chunks: list[EmbeddedChunk]
+    embedding_model: str
+    embedding_dimension: int
+    provider_name: str
+    indexed_text_type: str = "original"
+
+
+@dataclass(frozen=True)
+class RetrievalResult:
+    """
+    Ranked retrieval result returned by embedding_search().
+    """
+
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata
+    score: float
+    score_type: str
+    rank: int
+    retriever_name: str
+
+
+@dataclass(frozen=True)
+class RetrievalResponse:
+    """
+    Structured output shape for downstream RAG steps.
+
+    Enterprise output should not return only a plain string.
+    It should preserve query, results, context, warnings, and config used.
+    """
+
+    query: str
+    results: list[RetrievalResult]
+    context: str
+    result_count: int
+    warnings: list[str]
+    config_used: Metadata
+
+
+@dataclass(frozen=True)
+class EmbeddingRetrievalConfig:
+    """
+    Query-time retrieval configuration.
+    """
+
+    top_k: int = 5
+    max_context_tokens: int = 1200
+    filters: Metadata = field(default_factory=dict)
+    retriever_name: str = "embedding_fake"
+    include_scores_in_context: bool = True
+
+
+# =============================================================================
+# Provider isolation
+# =============================================================================
+
+
+class EmbeddingClient(Protocol):
+    """
+    Provider interface.
+
+    Any real embedding provider should implement this contract.
+
+    Example production wrappers:
+    - VoyageEmbeddingClient
+    - OpenAIEmbeddingClient
+    - LocalEmbeddingClient
+
+    This example uses FakeEmbeddingClient so it can run locally without
+    API keys, network access, or paid services.
+    """
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        ...
+
+    def embed_query(self, query: str) -> list[float]:
+        ...
+
+
+class FakeEmbeddingClient:
+    """
+    Deterministic fake embedding client.
+
+    This is for examples and unit tests only.
+
+    It maps text into a small concept vector so ranking behavior is predictable.
+    It is intentionally simple, transparent, and stable.
+    """
+
+    _concepts: tuple[tuple[str, tuple[str, ...]], ...] = (
+        (
+            "finance",
+            (
+                "financial",
+                "finance",
+                "revenue",
+                "profit",
+                "margin",
+                "earnings",
+                "sales",
+                "operating",
+                "cost",
+                "income",
+            ),
+        ),
+        (
+            "account_access",
+            (
+                "password",
+                "login",
+                "account",
+                "reset",
+                "authentication",
+                "security",
+                "credentials",
+                "sign",
+            ),
+        ),
+        (
+            "contracts",
+            (
+                "contract",
+                "agreement",
+                "termination",
+                "renewal",
+                "clause",
+                "legal",
+                "liability",
+                "terms",
+            ),
+        ),
+        (
+            "customer_success",
+            (
+                "customer",
+                "onboarding",
+                "support",
+                "ticket",
+                "success",
+                "implementation",
+                "training",
+            ),
+        ),
+        (
+            "infrastructure",
+            (
+                "infrastructure",
+                "server",
+                "database",
+                "latency",
+                "deployment",
+                "cloud",
+                "compute",
+                "storage",
+            ),
+        ),
+    )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            raise ValueError("texts cannot be empty.")
+
+        return [self._embed(text) for text in texts]
+
+    def embed_query(self, query: str) -> list[float]:
+        if not query or not query.strip():
+            raise ValueError("query cannot be empty.")
+
+        return self._embed(query)
+
+    def _embed(self, text: str) -> list[float]:
+        normalized = normalize_text(text)
+
+        vector: list[float] = []
+
+        for _, terms in self._concepts:
+            score = 0.0
+
+            for term in terms:
+                if term in normalized:
+                    score += 1.0
+
+            vector.append(score)
+
+        # Add a small lexical-length signal to avoid all-zero ties becoming
+        # completely uninformative in demo data.
+        vector.append(min(len(normalized) / 500.0, 1.0))
+
+        return vector
+
+
+# =============================================================================
+# Validation helpers
+# =============================================================================
+
+
+def normalize_text(text: str) -> str:
+    return " ".join(text.lower().strip().split())
+
+
+def estimate_token_count(text: str) -> int:
+    """
+    Lightweight deterministic token estimator.
+
+    Production systems should use the tokenizer for the target model when
+    strict token limits matter.
+    """
+
+    if not text:
+        return 0
+
+    return max(1, math.ceil(len(text) / 4))
+
+
+def stable_text_hash(text: str) -> str:
+    if text is None:
+        raise ValueError("text cannot be None.")
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def validate_non_empty_string(value: str, field_name: str) -> None:
+    if not value or not value.strip():
+        raise ValueError(f"{field_name} cannot be empty.")
+
+
+def validate_text_chunk(chunk: TextChunk) -> None:
+    validate_non_empty_string(chunk.chunk_id, "chunk_id")
+    validate_non_empty_string(chunk.document_id, "document_id")
+    validate_non_empty_string(chunk.text, f"text for chunk {chunk.chunk_id}")
+
+    if chunk.token_count <= 0:
+        raise ValueError(f"token_count must be positive for chunk {chunk.chunk_id}.")
+
+    if chunk.metadata is None:
+        raise ValueError(f"metadata cannot be None for chunk {chunk.chunk_id}.")
+
+
+def validate_embedding_vector(vector: list[float]) -> None:
+    if not vector:
+        raise ValueError("Embedding vector cannot be empty.")
+
+    for value in vector:
+        if not isinstance(value, (int, float)):
+            raise ValueError("Embedding vector must contain only numeric values.")
+
+        if math.isnan(value) or math.isinf(value):
+            raise ValueError("Embedding vector cannot contain NaN or infinity.")
+
+
+def validate_embedding_dimensions(embeddings: list[list[float]]) -> int:
+    if not embeddings:
+        raise ValueError("embeddings cannot be empty.")
+
+    first_dimension = len(embeddings[0])
+
+    if first_dimension <= 0:
+        raise ValueError("embedding dimension must be greater than zero.")
+
+    for embedding in embeddings:
+        validate_embedding_vector(embedding)
+
+        if len(embedding) != first_dimension:
+            raise ValueError("All embeddings must have the same dimension.")
+
+    return first_dimension
+
+
+def validate_retrieval_config(config: EmbeddingRetrievalConfig) -> None:
+    if config.top_k <= 0:
+        raise ValueError("top_k must be greater than zero.")
+
+    if config.max_context_tokens <= 0:
+        raise ValueError("max_context_tokens must be greater than zero.")
+
+    validate_non_empty_string(config.retriever_name, "retriever_name")
+
+
+# =============================================================================
+# Metadata filtering
+# =============================================================================
+
+
+def metadata_matches_filters(
+    metadata: Metadata,
+    filters: Metadata,
+) -> bool:
+    """
+    Exact metadata filter helper.
+
+    Enterprise note:
+    - apply user_id, organization_id, and permission filters before returning
+      results
+    - do not silently ignore permission filters
+    - external vector databases should apply filters server-side when possible
+    """
+
+    for key, expected_value in filters.items():
+        actual_value = metadata.get(key)
+
+        if isinstance(expected_value, (list, tuple, set)):
+            if actual_value not in expected_value:
+                return False
+        else:
+            if actual_value != expected_value:
+                return False
+
+    return True
+
+
+# =============================================================================
+# Embedding and indexing
+# =============================================================================
+
+
+def embed_chunks(
+    *,
+    chunks: list[TextChunk],
+    embedding_client: EmbeddingClient,
+    embedding_model: str,
+    provider_name: str,
+    indexed_text_type: str = "original",
+) -> list[EmbeddedChunk]:
+    """
+    Embed validated chunks.
+
+    Rules:
+    - preserve original chunks
+    - preserve metadata
+    - validate embedding count
+    - validate dimensions
+    - record provider/model/indexed_text_type
+    """
+
+    if not chunks:
+        raise ValueError("chunks cannot be empty.")
+
+    validate_non_empty_string(embedding_model, "embedding_model")
+    validate_non_empty_string(provider_name, "provider_name")
+    validate_non_empty_string(indexed_text_type, "indexed_text_type")
+
+    texts: list[str] = []
+
+    for chunk in chunks:
+        validate_text_chunk(chunk)
+        texts.append(chunk.text)
+
+    embeddings = embedding_client.embed_documents(texts)
+
+    if len(embeddings) != len(chunks):
+        raise RuntimeError(
+            f"Embedding count mismatch. Expected {len(chunks)}, got {len(embeddings)}."
+        )
+
+    embedding_dimension = validate_embedding_dimensions(embeddings)
+
+    embedded_chunks: list[EmbeddedChunk] = []
+
+    for chunk, embedding in zip(chunks, embeddings):
+        embedded_chunks.append(
+            EmbeddedChunk(
+                chunk=chunk,
+                embedding=embedding,
+                embedding_model=embedding_model,
+                embedding_dimension=embedding_dimension,
+                provider_name=provider_name,
+                indexed_text_type=indexed_text_type,
+                metadata={
+                    **chunk.metadata,
+                    "embedding_model": embedding_model,
+                    "embedding_dimension": embedding_dimension,
+                    "embedding_provider": provider_name,
+                    "indexed_text_type": indexed_text_type,
+                    "indexed_text_hash": stable_text_hash(chunk.text),
+                },
+            )
+        )
+
+    return embedded_chunks
+
+
+def build_embedding_index(
+    *,
+    embedded_chunks: list[EmbeddedChunk],
+    embedding_model: str,
+    provider_name: str,
+    indexed_text_type: str = "original",
+) -> EmbeddingIndex:
+    """
+    Build an in-memory embedding index.
+
+    Rules:
+    - do not mix models
+    - do not mix dimensions
+    - do not mix providers
+    - do not mix original/contextualized text without explicit separation
+    """
+
+    if not embedded_chunks:
+        raise ValueError("embedded_chunks cannot be empty.")
+
+    validate_non_empty_string(embedding_model, "embedding_model")
+    validate_non_empty_string(provider_name, "provider_name")
+    validate_non_empty_string(indexed_text_type, "indexed_text_type")
+
+    first_dimension = embedded_chunks[0].embedding_dimension
+
+    if first_dimension <= 0:
+        raise ValueError("embedding dimension must be greater than zero.")
+
+    for item in embedded_chunks:
+        validate_embedding_vector(item.embedding)
+
+        if len(item.embedding) != first_dimension:
+            raise ValueError(
+                f"Vector length mismatch for chunk {item.chunk.chunk_id}."
+            )
+
+        if item.embedding_dimension != first_dimension:
+            raise ValueError(
+                f"Embedding dimension mismatch for chunk {item.chunk.chunk_id}."
+            )
+
+        if item.embedding_model != embedding_model:
+            raise ValueError(
+                f"Embedding model mismatch for chunk {item.chunk.chunk_id}."
+            )
+
+        if item.provider_name != provider_name:
+            raise ValueError(
+                f"Embedding provider mismatch for chunk {item.chunk.chunk_id}."
+            )
+
+        if item.indexed_text_type != indexed_text_type:
+            raise ValueError(
+                f"Indexed text type mismatch for chunk {item.chunk.chunk_id}."
+            )
+
+    return EmbeddingIndex(
+        embedded_chunks=embedded_chunks,
+        embedding_model=embedding_model,
+        embedding_dimension=first_dimension,
+        provider_name=provider_name,
+        indexed_text_type=indexed_text_type,
+    )
+
+
+# =============================================================================
+# Similarity and retrieval
+# =============================================================================
+
+
+def cosine_similarity(vector_a: list[float], vector_b: list[float]) -> float:
+    validate_embedding_vector(vector_a)
+    validate_embedding_vector(vector_b)
+
+    if len(vector_a) != len(vector_b):
+        raise ValueError("Vectors must have the same dimension.")
+
+    dot_product = sum(a * b for a, b in zip(vector_a, vector_b))
+    magnitude_a = math.sqrt(sum(a * a for a in vector_a))
+    magnitude_b = math.sqrt(sum(b * b for b in vector_b))
+
+    if magnitude_a == 0 or magnitude_b == 0:
+        return 0.0
+
+    return dot_product / (magnitude_a * magnitude_b)
+
+
+def embedding_search(
+    *,
+    query: str,
+    index: EmbeddingIndex,
+    embedding_client: EmbeddingClient,
+    config: EmbeddingRetrievalConfig,
+) -> list[RetrievalResult]:
+    """
+    Retrieve chunks ranked by cosine similarity.
+
+    Rules:
+    - validate query
+    - validate config
+    - validate query embedding dimension
+    - apply metadata filters
+    - preserve metadata
+    - return structured ranked results
+    - stable tie-break by chunk_id
+    """
+
+    validate_non_empty_string(query, "query")
+    validate_retrieval_config(config)
+
+    if not index.embedded_chunks:
+        return []
+
+    query_embedding = embedding_client.embed_query(query)
+
+    validate_embedding_vector(query_embedding)
+
+    if len(query_embedding) != index.embedding_dimension:
+        raise ValueError(
+            "Query embedding dimension does not match index embedding dimension."
+        )
+
+    scored_results: list[tuple[float, EmbeddedChunk]] = []
+
+    for item in index.embedded_chunks:
+        chunk = item.chunk
+
+        if not metadata_matches_filters(chunk.metadata, config.filters):
+            continue
+
+        score = cosine_similarity(query_embedding, item.embedding)
+        scored_results.append((score, item))
+
+    scored_results.sort(
+        key=lambda item: (-item[0], item[1].chunk.chunk_id)
+    )
+
+    results: list[RetrievalResult] = []
+
+    for rank, (score, item) in enumerate(scored_results[: config.top_k], start=1):
+        chunk = item.chunk
+
+        results.append(
+            RetrievalResult(
+                chunk_id=chunk.chunk_id,
+                document_id=chunk.document_id,
+                text=chunk.text,
+                token_count=chunk.token_count,
+                metadata={
+                    **chunk.metadata,
+                    "embedding_model": index.embedding_model,
+                    "embedding_provider": index.provider_name,
+                    "embedding_dimension": index.embedding_dimension,
+                    "indexed_text_type": index.indexed_text_type,
+                },
+                score=score,
+                score_type="cosine_similarity",
+                rank=rank,
+                retriever_name=config.retriever_name,
+            )
+        )
+
+    return results
+
+
+# =============================================================================
+# Context output
+# =============================================================================
+
+
+def format_result_for_context(
+    *,
+    result: RetrievalResult,
+    include_scores: bool,
+) -> str:
+    document_name = result.metadata.get("document_name", "unknown")
+    page_number = result.metadata.get("page_number")
+    section_heading = result.metadata.get("section_heading")
+
+    header_parts = [
+        f"Source: {document_name}",
+        f"Chunk: {result.chunk_id}",
+    ]
+
+    if page_number is not None:
+        header_parts.append(f"Page: {page_number}")
+
+    if section_heading:
+        header_parts.append(f"Section: {section_heading}")
+
+    if include_scores:
+        header_parts.append(f"{result.score_type}: {result.score:.4f}")
+        header_parts.append(f"Rank: {result.rank}")
+        header_parts.append(f"Retriever: {result.retriever_name}")
+
+    header = f"[{' | '.join(header_parts)}]"
+
+    return f"{header}\n{result.text.strip()}"
+
+
+def build_context_block(
+    *,
+    results: list[RetrievalResult],
+    max_context_tokens: int,
+    include_scores: bool = True,
+) -> tuple[str, list[str]]:
+    """
+    Build a simple token-budget-aware context block.
+
+    This is intentionally small because this file focuses on embedding retrieval.
+    A full enterprise context builder should live in contextbuilding.md.
+    """
+
+    if max_context_tokens <= 0:
+        raise ValueError("max_context_tokens must be greater than zero.")
+
+    blocks: list[str] = []
+    warnings: list[str] = []
+    used_tokens = 0
+    seen_chunk_ids: set[str] = set()
+
+    for result in results:
+        if result.chunk_id in seen_chunk_ids:
+            warnings.append(f"Skipped duplicate chunk: {result.chunk_id}")
+            continue
+
+        block = format_result_for_context(
+            result=result,
+            include_scores=include_scores,
+        )
+
+        block_tokens = estimate_token_count(block)
+
+        if used_tokens + block_tokens > max_context_tokens:
+            warnings.append(
+                f"Skipped chunk {result.chunk_id} because it would exceed max_context_tokens."
+            )
+            continue
+
+        blocks.append(block)
+        seen_chunk_ids.add(result.chunk_id)
+        used_tokens += block_tokens
+
+    if not blocks:
+        warnings.append("No context blocks were included.")
+
+    return "\n\n---\n\n".join(blocks), warnings
+
+
+# =============================================================================
+# Orchestration
+# =============================================================================
+
+
+def retrieve_context_for_query(
+    *,
+    query: str,
+    chunks: list[TextChunk],
+    embedding_client: EmbeddingClient,
+    embedding_model: str,
+    provider_name: str,
+    config: EmbeddingRetrievalConfig,
+    indexed_text_type: str = "original",
+) -> RetrievalResponse:
+    """
+    End-to-end basic embedding retrieval helper.
+
+    This is the preferred output style for examples:
+    - validate
+    - embed
+    - index
+    - retrieve
+    - build context
+    - return structured response
+    """
+
+    validate_non_empty_string(query, "query")
+    validate_retrieval_config(config)
+
+    embedded_chunks = embed_chunks(
+        chunks=chunks,
+        embedding_client=embedding_client,
+        embedding_model=embedding_model,
+        provider_name=provider_name,
+        indexed_text_type=indexed_text_type,
+    )
+
+    index = build_embedding_index(
+        embedded_chunks=embedded_chunks,
+        embedding_model=embedding_model,
+        provider_name=provider_name,
+        indexed_text_type=indexed_text_type,
+    )
+
+    results = embedding_search(
+        query=query,
+        index=index,
+        embedding_client=embedding_client,
+        config=config,
+    )
+
+    context, warnings = build_context_block(
+        results=results,
+        max_context_tokens=config.max_context_tokens,
+        include_scores=config.include_scores_in_context,
+    )
+
+    return RetrievalResponse(
+        query=query,
+        results=results,
+        context=context,
+        result_count=len(results),
+        warnings=warnings,
+        config_used={
+            "top_k": config.top_k,
+            "max_context_tokens": config.max_context_tokens,
+            "filters": config.filters,
+            "retriever_name": config.retriever_name,
+            "embedding_model": embedding_model,
+            "provider_name": provider_name,
+            "indexed_text_type": indexed_text_type,
+        },
+    )
+
+
+# =============================================================================
+# Demo data
+# =============================================================================
+
+
+def make_demo_chunks() -> list[TextChunk]:
+    """
+    Demo corpus.
+
+    Metadata intentionally includes user_id and organization_id so the example
+    demonstrates permission-aware filtering.
+    """
+
+    raw_chunks = [
+        {
+            "chunk_id": "q4-report:chunk-001",
+            "document_id": "q4-report",
+            "text": (
+                "Revenue increased by 18% in Q4 as enterprise customers expanded "
+                "their annual contracts and operating margin improved."
+            ),
+            "metadata": {
+                "document_name": "Q4 Financial Report",
+                "page_number": 4,
+                "section_heading": "Financial Performance",
+                "user_id": "user_123",
+                "organization_id": "org_abc",
+                "source_type": "pdf",
+            },
+        },
+        {
+            "chunk_id": "help-center:chunk-001",
+            "document_id": "help-center",
+            "text": (
+                "Users can reset their password from the account security page "
+                "after verifying their email address."
+            ),
+            "metadata": {
+                "document_name": "Help Center Article",
+                "page_number": 1,
+                "section_heading": "Password Reset",
+                "user_id": "user_123",
+                "organization_id": "org_abc",
+                "source_type": "html",
+            },
+        },
+        {
+            "chunk_id": "msa:chunk-001",
+            "document_id": "msa",
+            "text": (
+                "The customer agreement renews annually unless either party sends "
+                "a termination notice before the renewal date."
+            ),
+            "metadata": {
+                "document_name": "Master Services Agreement",
+                "page_number": 9,
+                "section_heading": "Renewal and Termination",
+                "user_id": "user_123",
+                "organization_id": "org_abc",
+                "source_type": "docx",
+            },
+        },
+        {
+            "chunk_id": "infra-plan:chunk-001",
+            "document_id": "infra-plan",
+            "text": (
+                "Database latency decreased after the infrastructure team moved "
+                "read-heavy workloads to dedicated replicas."
+            ),
+            "metadata": {
+                "document_name": "Infrastructure Plan",
+                "page_number": 2,
+                "section_heading": "Database Performance",
+                "user_id": "user_999",
+                "organization_id": "org_other",
+                "source_type": "md",
+            },
+        },
+    ]
+
+    chunks: list[TextChunk] = []
+
+    for item in raw_chunks:
+        text = item["text"]
+
+        chunks.append(
+            TextChunk(
+                chunk_id=item["chunk_id"],
+                document_id=item["document_id"],
+                text=text,
+                token_count=estimate_token_count(text),
+                metadata=item["metadata"],
+            )
+        )
+
+    return chunks
+
+
+# =============================================================================
+# Example run
+# =============================================================================
+
+
+def main() -> None:
+    chunks = make_demo_chunks()
+
+    embedding_client = FakeEmbeddingClient()
+
+    config = EmbeddingRetrievalConfig(
+        top_k=3,
+        max_context_tokens=900,
+        filters={
+            "user_id": "user_123",
+            "organization_id": "org_abc",
+        },
+        retriever_name="embedding_fake",
+        include_scores_in_context=True,
+    )
+
+    response = retrieve_context_for_query(
+        query="How did financial performance improve?",
+        chunks=chunks,
+        embedding_client=embedding_client,
+        embedding_model="fake-concept-embedding-v1",
+        provider_name="fake",
+        config=config,
+        indexed_text_type="original",
+    )
+
+    print("RETRIEVAL RESPONSE")
+    print("==================")
+    print(
+        json.dumps(
+            {
+                "query": response.query,
+                "result_count": response.result_count,
+                "results": [
+                    {
+                        "rank": result.rank,
+                        "chunk_id": result.chunk_id,
+                        "document_id": result.document_id,
+                        "score": round(result.score, 4),
+                        "score_type": result.score_type,
+                        "retriever_name": result.retriever_name,
+                        "document_name": result.metadata.get("document_name"),
+                    }
+                    for result in response.results
+                ],
+                "warnings": response.warnings,
+                "config_used": response.config_used,
+            },
+            indent=2,
+        )
+    )
+
+    print("\nCONTEXT")
+    print("=======")
+    print(response.context)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+output_path = Path("example_basic_embedding_retrieval.py")
+
+if output_path.exists():
+    raise FileExistsError(
+        "example_basic_embedding_retrieval.py already exists. "
+        "This script will not overwrite it. "
+        "Delete or rename the existing file if you intentionally want to recreate it."
+    )
+
+output_path.write_text(
+    example_basic_embedding_retrieval_py,
+    encoding="utf-8",
+)

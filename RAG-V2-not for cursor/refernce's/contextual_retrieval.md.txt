@@ -1,0 +1,1399 @@
+from pathlib import Path
+
+contextual_retrieval_md = r"""# Contextual Retrieval Reference
+
+This file defines the expected enterprise standard for contextual retrieval preprocessing in a modular RAG system.
+
+Contextual retrieval is an ingestion-time enhancement layer.
+
+It is not usually a third independent retriever.
+
+In this architecture, contextual retrieval means:
+
+- generate a short, source-grounded context note for each chunk
+- combine that context note with the original chunk text for indexing
+- preserve the original chunk text separately
+- use contextualized text for keyword and embedding indexes
+- return original chunk text in final LLM context unless explicitly requested otherwise
+- preserve metadata, permissions, provenance, and auditability throughout the pipeline
+
+---
+
+## Purpose
+
+Chunks often lose meaning when separated from their source document.
+
+Example original chunk:
+
+    Revenue increased by 14% in the second quarter.
+
+This chunk is ambiguous without context.
+
+It does not say:
+
+- which company the revenue belongs to
+- which report the number came from
+- which fiscal year is being discussed
+- whether the metric is total revenue, net revenue, or recurring revenue
+- whether this belongs to a department, business unit, or full company
+
+A contextualized version for indexing might be:
+
+    This chunk is from Acme Corp's FY2025 Q2 shareholder letter and discusses company-wide revenue performance.
+
+    Revenue increased by 14% in the second quarter.
+
+The contextualized text is better for retrieval.
+
+The original source text is usually better for final answer context.
+
+---
+
+## Core Enterprise Rule
+
+Contextual retrieval must improve search quality without weakening trust, privacy, source integrity, or access control.
+
+The system must never permanently replace original source text with synthetic context.
+
+Correct:
+
+    Original chunk text is preserved.
+    Context summary is stored separately.
+    Contextualized text is used for indexing.
+    Final answer context uses original source text by default.
+
+Incorrect:
+
+    chunk.text = generated_context + chunk.text
+
+Why incorrect:
+
+- mutates source text
+- mixes synthetic text with original evidence
+- makes citations less trustworthy
+- complicates audits
+- can leak generated context into final answers unintentionally
+
+---
+
+## Required Behavior
+
+A gold-standard contextual retrieval implementation must:
+
+- run during ingestion, not query time
+- generate one concise context note per chunk
+- preserve original chunk text
+- store contextualized text separately
+- preserve chunk_id and document_id
+- preserve metadata
+- preserve permission and tenant metadata
+- record context model
+- record prompt version
+- record context generation timestamp when useful
+- support caching
+- support cache invalidation
+- support deterministic tests with fake generators
+- avoid live LLM calls in unit tests
+- avoid sending unrelated documents to the context generator
+- avoid logging sensitive document text by default
+- make contextual retrieval optional
+- warn about ingestion cost and latency
+- keep provider-specific LLM logic isolated
+
+---
+
+## Important Design Rule
+
+Contextual retrieval is normally a preprocessing step.
+
+Correct default architecture:
+
+    documents
+    -> extract text
+    -> chunk text
+    -> generate context summary per chunk
+    -> build contextualized text
+    -> index contextualized text using TF-IDF and/or embeddings
+    -> retrieve with keyword and/or embedding retrieval
+    -> fuse and optionally rerank
+    -> return original chunk text in final context
+
+Incorrect default architecture:
+
+    keyword results
+    + embedding results
+    + contextual retrieval results
+    -> fusion
+
+Only treat contextual retrieval as a separate ranking signal if the user explicitly requests experimental contextual scoring.
+
+---
+
+## Enterprise Concerns
+
+Contextual retrieval in enterprise systems must account for:
+
+- data privacy
+- tenant isolation
+- permission-scoped retrieval
+- auditability
+- reproducibility
+- cost control
+- latency control
+- cache invalidation
+- prompt versioning
+- model versioning
+- source integrity
+- metadata preservation
+- compliance review
+- secure logging
+- deterministic test coverage
+
+Do not optimize only for retrieval quality.
+
+Enterprise retrieval must also be traceable, secure, maintainable, and testable.
+
+---
+
+## Data Models
+
+Python-style contracts:
+
+    from __future__ import annotations
+
+    from dataclasses import dataclass, field
+    from typing import Any, Protocol
+    from datetime import datetime
+
+
+    Metadata = dict[str, Any]
+
+
+    @dataclass(frozen=True)
+    class DocumentRecord:
+        document_id: str
+        document_name: str
+        source_type: str
+        text: str
+        metadata: Metadata = field(default_factory=dict)
+        source_uri: str | None = None
+
+
+    @dataclass(frozen=True)
+    class TextChunk:
+        chunk_id: str
+        document_id: str
+        text: str
+        token_count: int
+        metadata: Metadata = field(default_factory=dict)
+
+
+    @dataclass(frozen=True)
+    class ContextualizedChunk:
+        chunk: TextChunk
+        contextualized_text: str
+        context_summary: str
+        context_model: str
+        prompt_version: str
+        chunk_text_hash: str
+        generated_at: datetime | None = None
+        metadata: Metadata = field(default_factory=dict)
+
+
+    @dataclass(frozen=True)
+    class ContextualizationConfig:
+        enabled: bool = False
+        context_model: str = ""
+        prompt_version: str = "v1"
+        max_context_tokens: int = 120
+        include_document_name: bool = True
+        include_source_type: bool = True
+        include_section_heading: bool = True
+        include_page_number: bool = True
+        include_source_uri: bool = False
+        cache_enabled: bool = True
+        return_original_text_by_default: bool = True
+
+
+    @dataclass(frozen=True)
+    class ContextGenerationRequest:
+        document_id: str
+        document_name: str
+        source_type: str
+        chunk_id: str
+        chunk_text: str
+        document_metadata: Metadata
+        chunk_metadata: Metadata
+        max_context_tokens: int
+
+
+    @dataclass(frozen=True)
+    class ContextGenerationResult:
+        context_summary: str
+        context_model: str
+        prompt_version: str
+        token_estimate: int
+        warnings: list[str] = field(default_factory=list)
+
+---
+
+## Context Generator Interface
+
+Provider-specific context generation must be isolated.
+
+Use a protocol or wrapper so the rest of the system does not depend on one LLM provider.
+
+    class ChunkContextGenerator(Protocol):
+        def generate_context(
+            self,
+            *,
+            document: DocumentRecord,
+            chunk: TextChunk,
+            max_context_tokens: int,
+        ) -> str:
+            ...
+
+Rules:
+
+- Do not call the LLM directly from chunking logic.
+- Do not call the LLM directly from retrieval logic.
+- Do not hardcode API keys.
+- Do not require one provider unless the user selected one.
+- Keep context generation replaceable.
+- Use fake context generators in unit tests.
+- Use real provider calls only in integration tests or ingestion jobs.
+
+---
+
+## Context Prompt Contract
+
+The context-generation prompt should be short, bounded, source-grounded, and retrieval-oriented.
+
+Recommended instruction:
+
+    You are generating retrieval context for one chunk from a larger document.
+
+    Write one short sentence that helps identify what this chunk is about and where it fits in the document.
+
+    Use only the document and metadata provided.
+    Do not add facts that are not supported by the document.
+    Do not summarize the whole document.
+    Do not answer a user question.
+    Do not include speculation.
+    Do not include confidential information that is not present in the provided chunk or allowed metadata.
+    Keep the context concise.
+
+Recommended inputs:
+
+- document name
+- source type
+- section heading when available
+- page number when available
+- nearby heading when available
+- document-level summary when available and approved
+- chunk text
+- allowed metadata only
+
+Do not include:
+
+- unrelated documents
+- documents from other users
+- documents from other tenants
+- hidden system instructions
+- API keys
+- secrets
+- private metadata not needed for retrieval
+
+---
+
+## Context Quality Rules
+
+Generated context should be:
+
+- concise
+- specific
+- source-grounded
+- useful for retrieval
+- factually supported
+- not a full summary
+- not an answer to a user question
+- not a replacement for source text
+- free of unsupported claims
+- free of subjective interpretation
+- safe for indexing
+
+Bad context:
+
+    This is an important financial section that proves the company is doing well.
+
+Why bad:
+
+- subjective
+- vague
+- may invent meaning
+- not clearly grounded
+- weak for auditability
+
+Good context:
+
+    This chunk is from the FY2025 Q2 shareholder letter and discusses company-wide operating margin.
+
+Why good:
+
+- concise
+- grounded
+- gives source location
+- improves retrieval terms
+- avoids unsupported interpretation
+
+---
+
+## Validation Helpers
+
+Validate before making expensive context-generation calls.
+
+    def validate_document_for_contextualization(document: DocumentRecord) -> None:
+        if not document.document_id or not document.document_id.strip():
+            raise ValueError("document_id cannot be empty.")
+
+        if not document.document_name or not document.document_name.strip():
+            raise ValueError("document_name cannot be empty.")
+
+        if not document.text or not document.text.strip():
+            raise ValueError("document text cannot be empty.")
+
+
+    def validate_chunk_for_contextualization(
+        *,
+        document: DocumentRecord,
+        chunk: TextChunk,
+    ) -> None:
+        if not chunk.chunk_id or not chunk.chunk_id.strip():
+            raise ValueError("chunk_id cannot be empty.")
+
+        if not chunk.document_id or not chunk.document_id.strip():
+            raise ValueError("chunk.document_id cannot be empty.")
+
+        if chunk.document_id != document.document_id:
+            raise ValueError("chunk.document_id must match document.document_id.")
+
+        if not chunk.text or not chunk.text.strip():
+            raise ValueError(f"chunk text cannot be empty: {chunk.chunk_id}")
+
+        if chunk.token_count <= 0:
+            raise ValueError(f"chunk token_count must be positive: {chunk.chunk_id}")
+
+
+    def validate_contextualization_config(config: ContextualizationConfig) -> None:
+        if not config.enabled:
+            return
+
+        if not config.context_model or not config.context_model.strip():
+            raise ValueError("context_model is required when contextual retrieval is enabled.")
+
+        if not config.prompt_version or not config.prompt_version.strip():
+            raise ValueError("prompt_version cannot be empty.")
+
+        if config.max_context_tokens <= 0:
+            raise ValueError("max_context_tokens must be greater than zero.")
+
+---
+
+## Hashing and Cache Keys
+
+Context generation should be cached when possible.
+
+The cache key must change when the chunk text, context model, or prompt version changes.
+
+    import hashlib
+
+
+    def hash_text(text: str) -> str:
+        if text is None:
+            raise ValueError("text cannot be None.")
+
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+    def make_context_cache_key(
+        *,
+        document_id: str,
+        chunk_id: str,
+        chunk_text: str,
+        context_model: str,
+        prompt_version: str,
+    ) -> str:
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id cannot be empty.")
+
+        if not chunk_id or not chunk_id.strip():
+            raise ValueError("chunk_id cannot be empty.")
+
+        if not chunk_text or not chunk_text.strip():
+            raise ValueError("chunk_text cannot be empty.")
+
+        if not context_model or not context_model.strip():
+            raise ValueError("context_model cannot be empty.")
+
+        if not prompt_version or not prompt_version.strip():
+            raise ValueError("prompt_version cannot be empty.")
+
+        text_hash = hash_text(chunk_text)
+
+        return (
+            f"{document_id}:"
+            f"{chunk_id}:"
+            f"{context_model}:"
+            f"{prompt_version}:"
+            f"{text_hash}"
+        )
+
+Rules:
+
+- Regenerate context when chunk text changes.
+- Regenerate context when prompt version changes.
+- Regenerate context when context model changes.
+- Do not silently reuse stale context.
+- Store the chunk text hash with each contextualized chunk.
+
+---
+
+## Generate Chunk Context
+
+Function:
+
+    generate_chunk_context()
+
+Purpose:
+
+Generate a short note explaining where a chunk fits inside its source document.
+
+Inputs:
+
+- document
+- chunk
+- context generator
+- max_context_tokens
+
+Output:
+
+- context summary string
+
+Rules:
+
+- Reject empty document text.
+- Reject empty chunk text.
+- Reject chunk/document ID mismatch.
+- Keep output concise.
+- Do not invent unsupported facts.
+- Do not include unrelated documents.
+- Return a string, not a full answer.
+- Do not mutate the original chunk.
+
+    def generate_chunk_context(
+        *,
+        document: DocumentRecord,
+        chunk: TextChunk,
+        context_generator: ChunkContextGenerator,
+        max_context_tokens: int = 120,
+    ) -> str:
+        validate_document_for_contextualization(document)
+
+        validate_chunk_for_contextualization(
+            document=document,
+            chunk=chunk,
+        )
+
+        if max_context_tokens <= 0:
+            raise ValueError("max_context_tokens must be greater than zero.")
+
+        context_summary = context_generator.generate_context(
+            document=document,
+            chunk=chunk,
+            max_context_tokens=max_context_tokens,
+        )
+
+        if not context_summary or not context_summary.strip():
+            raise RuntimeError(f"Context generator returned empty context for {chunk.chunk_id}.")
+
+        return context_summary.strip()
+
+---
+
+## Build Contextualized Text
+
+Function:
+
+    build_contextualized_text()
+
+Purpose:
+
+Combine generated context with original chunk text for indexing.
+
+Inputs:
+
+- context summary
+- original chunk text
+
+Output:
+
+- contextualized text string
+
+Rules:
+
+- Context comes first.
+- Original chunk text remains unchanged.
+- Do not permanently rewrite the chunk.
+- Use a clear separator.
+- Keep contextualized text suitable for keyword and embedding indexes.
+
+    def build_contextualized_text(
+        *,
+        context_summary: str,
+        chunk_text: str,
+    ) -> str:
+        if not context_summary or not context_summary.strip():
+            raise ValueError("context_summary cannot be empty.")
+
+        if not chunk_text or not chunk_text.strip():
+            raise ValueError("chunk_text cannot be empty.")
+
+        return f"{context_summary.strip()}\n\n{chunk_text.strip()}"
+
+---
+
+## Build Contextualized Chunks
+
+Function:
+
+    build_contextualized_chunks()
+
+Purpose:
+
+Create contextualized chunk records for indexing.
+
+Inputs:
+
+- document
+- chunks
+- context generator
+- config
+
+Output:
+
+- list[ContextualizedChunk]
+
+Rules:
+
+- Reject empty chunk lists.
+- Validate each chunk belongs to the document.
+- Generate one context note per chunk.
+- Store original chunk separately.
+- Store contextualized text separately.
+- Preserve metadata.
+- Preserve permission metadata.
+- Record context model.
+- Record prompt version.
+- Record chunk text hash.
+- Do not mutate original chunks.
+
+    from datetime import datetime, timezone
+
+
+    def build_contextualized_chunks(
+        *,
+        document: DocumentRecord,
+        chunks: list[TextChunk],
+        context_generator: ChunkContextGenerator,
+        config: ContextualizationConfig,
+    ) -> list[ContextualizedChunk]:
+        validate_document_for_contextualization(document)
+        validate_contextualization_config(config)
+
+        if not config.enabled:
+            return []
+
+        if not chunks:
+            raise ValueError("chunks cannot be empty.")
+
+        contextualized_chunks: list[ContextualizedChunk] = []
+
+        for chunk in chunks:
+            validate_chunk_for_contextualization(
+                document=document,
+                chunk=chunk,
+            )
+
+            context_summary = generate_chunk_context(
+                document=document,
+                chunk=chunk,
+                context_generator=context_generator,
+                max_context_tokens=config.max_context_tokens,
+            )
+
+            contextualized_text = build_contextualized_text(
+                context_summary=context_summary,
+                chunk_text=chunk.text,
+            )
+
+            chunk_text_hash = hash_text(chunk.text)
+
+            contextualized_chunks.append(
+                ContextualizedChunk(
+                    chunk=chunk,
+                    contextualized_text=contextualized_text,
+                    context_summary=context_summary,
+                    context_model=config.context_model,
+                    prompt_version=config.prompt_version,
+                    chunk_text_hash=chunk_text_hash,
+                    generated_at=datetime.now(timezone.utc),
+                    metadata={
+                        **chunk.metadata,
+                        "contextualized": True,
+                        "context_model": config.context_model,
+                        "context_prompt_version": config.prompt_version,
+                        "chunk_text_hash": chunk_text_hash,
+                    },
+                )
+            )
+
+        return contextualized_chunks
+
+---
+
+## Fake Context Generator for Tests
+
+Unit tests should not call live LLM APIs.
+
+Use a fake generator for deterministic behavior.
+
+    class FakeChunkContextGenerator:
+        def generate_context(
+            self,
+            *,
+            document: DocumentRecord,
+            chunk: TextChunk,
+            max_context_tokens: int,
+        ) -> str:
+            section = chunk.metadata.get("section_heading", "unknown section")
+            page = chunk.metadata.get("page_number")
+
+            page_part = f" on page {page}" if page is not None else ""
+
+            return (
+                f"This chunk is from {document.document_name}{page_part} "
+                f"and belongs to the {section} section."
+            )
+
+Rules:
+
+- Unit tests must not require network access.
+- Unit tests must not require paid APIs.
+- Fake output should be stable across runs.
+- Integration tests may call a real provider if explicitly enabled.
+
+---
+
+## Contextualization Store Interface
+
+Enterprise systems should persist generated context.
+
+Use a storage adapter rather than hardcoding a database.
+
+    class ContextualizationStore(Protocol):
+        def get_contextualized_chunk(
+            self,
+            *,
+            cache_key: str,
+        ) -> ContextualizedChunk | None:
+            ...
+
+        def save_contextualized_chunk(
+            self,
+            *,
+            cache_key: str,
+            contextualized_chunk: ContextualizedChunk,
+        ) -> None:
+            ...
+
+Rules:
+
+- Keep storage replaceable.
+- Do not make contextualization logic depend on one database.
+- Do not store API keys.
+- Preserve tenant and permission metadata.
+- Use cache keys that include text hash, model, and prompt version.
+
+---
+
+## Cached Contextualization Flow
+
+Recommended flow:
+
+    def get_or_create_contextualized_chunk(
+        *,
+        document: DocumentRecord,
+        chunk: TextChunk,
+        context_generator: ChunkContextGenerator,
+        config: ContextualizationConfig,
+        store: ContextualizationStore | None = None,
+    ) -> ContextualizedChunk:
+        validate_document_for_contextualization(document)
+        validate_chunk_for_contextualization(document=document, chunk=chunk)
+        validate_contextualization_config(config)
+
+        cache_key = make_context_cache_key(
+            document_id=document.document_id,
+            chunk_id=chunk.chunk_id,
+            chunk_text=chunk.text,
+            context_model=config.context_model,
+            prompt_version=config.prompt_version,
+        )
+
+        if config.cache_enabled and store is not None:
+            cached = store.get_contextualized_chunk(cache_key=cache_key)
+
+            if cached is not None:
+                return cached
+
+        context_summary = generate_chunk_context(
+            document=document,
+            chunk=chunk,
+            context_generator=context_generator,
+            max_context_tokens=config.max_context_tokens,
+        )
+
+        contextualized_text = build_contextualized_text(
+            context_summary=context_summary,
+            chunk_text=chunk.text,
+        )
+
+        contextualized_chunk = ContextualizedChunk(
+            chunk=chunk,
+            contextualized_text=contextualized_text,
+            context_summary=context_summary,
+            context_model=config.context_model,
+            prompt_version=config.prompt_version,
+            chunk_text_hash=hash_text(chunk.text),
+            generated_at=datetime.now(timezone.utc),
+            metadata={
+                **chunk.metadata,
+                "contextualized": True,
+                "context_model": config.context_model,
+                "context_prompt_version": config.prompt_version,
+                "chunk_text_hash": hash_text(chunk.text),
+            },
+        )
+
+        if config.cache_enabled and store is not None:
+            store.save_contextualized_chunk(
+                cache_key=cache_key,
+                contextualized_chunk=contextualized_chunk,
+            )
+
+        return contextualized_chunk
+
+---
+
+## Indexing Adapter
+
+Keyword and embedding indexes may need TextChunk-shaped objects.
+
+When contextual retrieval is enabled, convert ContextualizedChunk objects into indexable chunks.
+
+Important:
+
+- indexable chunk text should be contextualized_text
+- chunk_id should remain the same
+- document_id should remain the same
+- metadata should preserve original metadata
+- original text should remain recoverable
+
+    def contextualized_chunks_to_indexable_text_chunks(
+        contextualized_chunks: list[ContextualizedChunk],
+    ) -> list[TextChunk]:
+        if not contextualized_chunks:
+            raise ValueError("contextualized_chunks cannot be empty.")
+
+        indexable_chunks: list[TextChunk] = []
+
+        for item in contextualized_chunks:
+            original = item.chunk
+
+            indexable_chunks.append(
+                TextChunk(
+                    chunk_id=original.chunk_id,
+                    document_id=original.document_id,
+                    text=item.contextualized_text,
+                    token_count=original.token_count,
+                    metadata={
+                        **original.metadata,
+                        "contextualized": True,
+                        "context_model": item.context_model,
+                        "context_prompt_version": item.prompt_version,
+                        "original_text": original.text,
+                        "chunk_text_hash": item.chunk_text_hash,
+                    },
+                )
+            )
+
+        return indexable_chunks
+
+Rules:
+
+- Use contextualized text for indexing.
+- Return original text in final context unless requested otherwise.
+- Deduplicate by chunk_id during fusion.
+- Do not create new chunk IDs for contextualized versions.
+
+---
+
+## Mapping Back to Original Chunks
+
+Because contextualized text is used for indexing, retrieval results must map back to original chunks.
+
+Required stable key:
+
+    chunk_id
+
+Rules:
+
+- Use the same chunk_id for original and contextualized forms.
+- Deduplicate by chunk_id during fusion.
+- Return original text in final context by default.
+- Keep contextualized text for indexing, debugging, and evaluation.
+- Do not expose contextualized text as source evidence unless explicitly requested.
+
+Recommended helper:
+
+    def restore_original_text_for_context(
+        *,
+        retrieval_text: str,
+        metadata: Metadata,
+    ) -> str:
+        original_text = metadata.get("original_text")
+
+        if original_text and isinstance(original_text, str):
+            return original_text
+
+        return retrieval_text
+
+---
+
+## Contextualized Keyword Retrieval
+
+When contextual retrieval is enabled for keyword retrieval:
+
+- build the TF-IDF index over contextualized text
+- preserve original chunk text
+- return original chunk text in final context
+- keep context summary available for debugging
+- keep prompt version available for audits
+
+Flow:
+
+    contextualized_chunks = build_contextualized_chunks(...)
+    indexable_chunks = contextualized_chunks_to_indexable_text_chunks(contextualized_chunks)
+    keyword_index = build_keyword_index(indexable_chunks)
+
+Rules:
+
+- Index contextualized text.
+- Do not replace source text.
+- Preserve permission metadata.
+- Preserve document metadata.
+- Preserve chunk_id.
+
+---
+
+## Contextualized Embedding Retrieval
+
+When contextual retrieval is enabled for embedding retrieval:
+
+- embed contextualized text
+- preserve original chunk text
+- return original chunk text in final context
+- record context model and prompt version
+- keep enough metadata to trace generated context back to the source chunk
+
+Flow:
+
+    contextualized_chunks = build_contextualized_chunks(...)
+    indexable_chunks = contextualized_chunks_to_indexable_text_chunks(contextualized_chunks)
+    embedded_chunks = embed_chunks(indexable_chunks)
+
+Rules:
+
+- Use contextualized text for embedding.
+- Do not discard original text.
+- Do not mix contextualized and non-contextualized embeddings in the same index unless explicitly labeled.
+- Store indexed_text_type as contextualized when the storage layer supports it.
+
+---
+
+## Contextual Retrieval in Hybrid Search
+
+Recommended enterprise hybrid flow:
+
+    documents
+    -> chunks
+    -> contextualized_chunks
+    -> indexable_chunks
+    -> keyword_index over indexable_chunks
+    -> embedding_index over indexable_chunks
+    -> keyword_search(query)
+    -> embedding_search(query)
+    -> reciprocal_rank_fusion()
+    -> optional rerank_results()
+    -> restore original text for final context
+    -> build_context_block()
+
+Rules:
+
+- Contextualization improves keyword and embedding retrieval.
+- RRF still fuses keyword and embedding result lists.
+- Contextual retrieval itself is not a default third list.
+- Final context should use original text unless requested otherwise.
+- Score provenance should indicate that contextualized indexes were used.
+
+---
+
+## Score and Provenance Requirements
+
+When contextualized indexes are used, retrieval results should preserve:
+
+- original score
+- score type
+- retriever name
+- chunk_id
+- document_id
+- whether contextualized index was used
+- context model
+- prompt version
+- original text hash
+- indexed text type
+
+Recommended metadata fields:
+
+    {
+        "contextualized": True,
+        "indexed_text_type": "contextualized",
+        "context_model": "selected-model",
+        "context_prompt_version": "v1",
+        "chunk_text_hash": "sha256-value"
+    }
+
+Do not label contextualized retrieval scores as source truth.
+
+The score is retrieval relevance, not factual confidence.
+
+---
+
+## Cost and Latency Rules
+
+Contextual retrieval adds ingestion cost.
+
+Costs come from:
+
+- one LLM call per chunk
+- longer text passed to keyword indexing
+- longer text passed to embedding models
+- more storage
+- slower ingestion
+- cache management
+
+Recommended controls:
+
+- make contextual retrieval optional
+- cache generated context
+- cap max_context_tokens
+- batch provider calls when supported
+- skip regeneration when chunk hash has not changed
+- separate unit tests from integration tests
+- allow contextualization to run as an offline ingestion job
+
+Do not generate context at query time for every chunk.
+
+Bad:
+
+    def contextual_retrieval(query, all_chunks):
+        for chunk in all_chunks:
+            generate_context(chunk)
+
+Why bad:
+
+- too slow
+- too expensive
+- does not scale
+- repeats ingestion work
+- creates unstable query-time behavior
+
+---
+
+## Security and Privacy Rules
+
+Never:
+
+- send documents from other users to the context generator
+- send documents from other tenants to the context generator
+- send unrelated documents into the context-generation prompt
+- include API keys or secrets in generated context
+- log full sensitive documents by default
+- ignore access-control metadata
+- store generated context without preserving permission metadata
+- return synthetic context as source evidence without labeling it
+
+Always preserve:
+
+- user_id when user-scoped
+- organization_id when organization-scoped
+- permissions when permission-scoped
+- document_id
+- chunk_id
+- source metadata required for auditability
+
+If retrieval is permission-scoped, contextualization must preserve permission metadata from the original chunk.
+
+---
+
+## Logging Rules
+
+Logs may include:
+
+- document_id
+- chunk_id
+- context_model
+- prompt_version
+- success/failure status
+- latency
+- token estimate
+- cache hit or miss
+
+Logs should not include by default:
+
+- full document text
+- full chunk text
+- generated context for sensitive corpora
+- API keys
+- access tokens
+- private URLs
+- customer secrets
+
+Use redaction when logs need debugging content.
+
+---
+
+## Failure Handling
+
+Context generation can fail.
+
+The system must define what happens when it fails.
+
+Acceptable policies:
+
+1. Fail ingestion
+
+Use when:
+
+- contextual retrieval is required
+- retrieval quality depends on context
+- strict consistency is required
+
+2. Fallback to original chunk text
+
+Use when:
+
+- contextual retrieval is optional
+- ingestion should continue
+- degraded retrieval is acceptable
+
+3. Mark chunk as not contextualized
+
+Use when:
+
+- partial indexing is allowed
+- monitoring will retry later
+
+Recommended enterprise default:
+
+- fail clearly when contextualization is required
+- fallback with warnings when contextualization is optional
+
+Do not silently skip failed chunks.
+
+---
+
+## Error Handling
+
+Raise clear errors for:
+
+- empty document text
+- empty chunk text
+- missing document_id
+- missing chunk_id
+- chunk/document ID mismatch
+- missing context generator
+- missing context model when enabled
+- invalid max_context_tokens
+- empty generated context
+- failed context-generation call
+- stale cache when strict regeneration is required
+- missing permission metadata when scoped retrieval requires it
+
+Return warnings for:
+
+- contextualization disabled
+- context generation fallback used
+- cached context reused
+- context summary exceeded desired length
+- provider latency above threshold
+- non-sensitive metadata missing
+
+---
+
+## Tests
+
+A gold-standard contextual retrieval implementation should include tests for the following cases.
+
+### Test 1 — Empty Document Text
+
+Input:
+
+    document.text = ""
+
+Expected:
+
+    ValueError
+
+### Test 2 — Empty Chunk Text
+
+Input:
+
+    chunk.text = ""
+
+Expected:
+
+    ValueError
+
+### Test 3 — Chunk Document Mismatch
+
+Input:
+
+    document.document_id = "doc-1"
+    chunk.document_id = "doc-2"
+
+Expected:
+
+    ValueError
+
+### Test 4 — Missing Context Model When Enabled
+
+Input:
+
+    ContextualizationConfig(enabled=True, context_model="")
+
+Expected:
+
+    ValueError
+
+### Test 5 — Context Is Generated
+
+Expected:
+
+- each chunk receives a non-empty context_summary
+
+### Test 6 — Original Text Is Preserved
+
+Expected:
+
+- ContextualizedChunk.chunk.text remains unchanged
+- contextualized_text contains context plus original text
+
+### Test 7 — Metadata Is Preserved
+
+Expected:
+
+- document_name remains available
+- page_number remains available
+- section_heading remains available
+- user_id remains available when present
+- organization_id remains available when present
+- permissions remain available when present
+- context_model is added
+- prompt_version is added
+
+### Test 8 — Fake Generator Is Deterministic
+
+Expected:
+
+- test output is stable across runs
+- no network call is required
+- no paid API is required
+
+### Test 9 — Cache Key Changes When Chunk Changes
+
+Expected:
+
+- modifying chunk text changes the cache key
+
+### Test 10 — Cache Key Changes When Prompt Version Changes
+
+Expected:
+
+- changing prompt_version changes the cache key
+
+### Test 11 — Cache Key Changes When Context Model Changes
+
+Expected:
+
+- changing context_model changes the cache key
+
+### Test 12 — Contextualized Text Is Used for Indexing
+
+Expected:
+
+- keyword or embedding index receives contextualized text
+- final context can still return original text
+
+### Test 13 — Permissions Are Preserved
+
+Expected:
+
+- permission metadata survives contextualization
+- tenant metadata survives contextualization
+- user-scoped metadata survives contextualization
+
+### Test 14 — Failed Context Generation Is Not Silent
+
+Expected:
+
+- strict mode raises an error
+- optional mode returns a warning or fallback depending on policy
+
+---
+
+## Bad vs Good
+
+Bad:
+
+    chunk.text = generate_context(chunk) + chunk.text
+
+Why bad:
+
+- mutates original source text
+- loses separation between source and synthetic context
+- weakens auditability
+- makes final answer context less trustworthy
+
+Bad:
+
+    def contextual_retrieval(query, chunks):
+        for chunk in chunks:
+            generate_context(chunk)
+
+Why bad:
+
+- runs at query time
+- too slow
+- too expensive
+- does not scale
+- creates unstable retrieval behavior
+
+Bad:
+
+    context = generate_context(document, chunk)
+    index.add(context)
+
+Why bad:
+
+- indexes only the synthetic context
+- loses the original chunk text
+- weakens retrieval quality
+- breaks traceability
+
+Good:
+
+    context_summary = generate_chunk_context(...)
+    contextualized_text = build_contextualized_text(
+        context_summary=context_summary,
+        chunk_text=chunk.text,
+    )
+
+    contextualized_chunk = ContextualizedChunk(
+        chunk=chunk,
+        contextualized_text=contextualized_text,
+        context_summary=context_summary,
+        context_model=config.context_model,
+        prompt_version=config.prompt_version,
+        chunk_text_hash=hash_text(chunk.text),
+        metadata={...},
+    )
+
+Good pipeline:
+
+    original chunks
+    -> contextualized chunks
+    -> index contextualized text
+    -> retrieve
+    -> map back by chunk_id
+    -> return original text in final context
+
+---
+
+## Acceptance Criteria
+
+A contextual retrieval implementation is enterprise-ready only if:
+
+- contextualization runs during ingestion
+- original chunk text is preserved
+- contextualized text is stored separately
+- context summaries are concise and grounded
+- provider logic is isolated
+- context model is recorded
+- prompt version is recorded
+- chunk text hash is recorded
+- cache invalidation is defined
+- metadata is preserved
+- permission metadata is preserved
+- tenant metadata is preserved when present
+- chunk_id remains stable
+- contextualized text can be indexed
+- final context can return original text
+- fake generator exists for unit tests
+- live provider tests are optional
+- cost and latency are explained
+- failures do not happen silently
+- no unrelated documents are sent to the context generator
+- no secrets are logged or stored
+- generated context is not treated as source truth
+
+---
+
+## Quality Checklist
+
+Before accepting contextual retrieval as gold standard, verify:
+
+- contextualization is optional
+- enabled contextualization requires a context model
+- context prompt is source-grounded
+- context prompt is bounded
+- context generator is provider-isolated
+- unit tests use a fake generator
+- original source text is never mutated
+- contextualized text is separate
+- metadata survives all transformations
+- permissions survive all transformations
+- cache key includes text hash
+- cache key includes model
+- cache key includes prompt version
+- indexing uses contextualized text when enabled
+- final context returns original text by default
+- failure policy is explicit
+- logs do not expose sensitive content
+- tests cover validation, caching, preservation, and security
+"""
+
+Path("contextual_retrieval.md").write_text(
+    contextual_retrieval_md,
+    encoding="utf-8",
+)

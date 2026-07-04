@@ -1,0 +1,860 @@
+from pathlib import Path
+
+example_keyword_retrieval_py = r'''"""
+example_keyword_retrieval.py
+
+Enterprise-grade basic keyword retrieval example.
+
+This file is intentionally self-contained and dependency-light.
+
+It demonstrates the expected output standard for a production-quality RAG helper:
+
+- clear data contracts
+- deterministic keyword retrieval
+- no external services
+- no paid APIs
+- no framework dependency
+- input validation before indexing and retrieval
+- stable tokenization
+- normalized term frequency
+- inverse document frequency
+- metadata preservation
+- permission-aware filtering
+- stable ranking and tie-breaking
+- structured retrieval results
+- token-budget-aware context output
+- readable example usage
+
+This is a basic keyword retrieval example, not a full RAG framework.
+
+It does not use LangChain, LlamaIndex, Elasticsearch, OpenSearch, or a database.
+Production systems may replace the in-memory index with a selected storage backend.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+from collections import Counter
+import json
+import math
+import re
+
+
+Metadata = dict[str, Any]
+
+
+# =============================================================================
+# Data contracts
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class TextChunk:
+    """
+    Original source chunk.
+
+    Rules:
+    - text must remain original source text
+    - chunk_id must be stable
+    - document_id must be stable
+    - metadata must preserve source and permission information
+    """
+
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class KeywordIndexEntry:
+    """
+    Keyword index entry for one chunk.
+
+    term_frequencies:
+        Raw term counts.
+
+    normalized_term_frequencies:
+        Term frequency divided by total indexed terms for the chunk.
+
+    metadata:
+        Preserved chunk metadata for filtering and traceability.
+    """
+
+    chunk: TextChunk
+    terms: list[str]
+    term_frequencies: dict[str, int]
+    normalized_term_frequencies: dict[str, float]
+    metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class KeywordIndex:
+    """
+    In-memory TF-IDF keyword index.
+
+    This example uses an in-memory index for clarity.
+    Production systems may persist this in SQLite, PostgreSQL, JSON, or a
+    search engine selected by the user.
+    """
+
+    entries: list[KeywordIndexEntry]
+    document_frequencies: dict[str, int]
+    inverse_document_frequencies: dict[str, float]
+    tokenizer_name: str
+    indexed_text_type: str = "original"
+
+
+@dataclass(frozen=True)
+class RetrievalResult:
+    """
+    Ranked retrieval result returned by keyword_search().
+    """
+
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata
+    score: float
+    score_type: str
+    rank: int
+    retriever_name: str
+
+
+@dataclass(frozen=True)
+class RetrievalResponse:
+    """
+    Structured output shape for downstream RAG steps.
+
+    Enterprise output should not return only a plain string.
+    It should preserve query, results, context, warnings, and config used.
+    """
+
+    query: str
+    results: list[RetrievalResult]
+    context: str
+    result_count: int
+    warnings: list[str]
+    config_used: Metadata
+
+
+@dataclass(frozen=True)
+class KeywordRetrievalConfig:
+    """
+    Query-time keyword retrieval configuration.
+    """
+
+    top_k: int = 5
+    max_context_tokens: int = 1200
+    filters: Metadata = field(default_factory=dict)
+    retriever_name: str = "keyword_tfidf"
+    include_scores_in_context: bool = True
+    min_score: float = 0.0
+
+
+# =============================================================================
+# Tokenization
+# =============================================================================
+
+
+DEFAULT_STOP_WORDS: frozenset[str] = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "has",
+        "have",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "this",
+        "to",
+        "was",
+        "were",
+        "will",
+        "with",
+    }
+)
+
+
+TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9]+")
+
+
+def tokenize_for_keyword_search(
+    text: str,
+    *,
+    stop_words: frozenset[str] = DEFAULT_STOP_WORDS,
+) -> list[str]:
+    """
+    Deterministic tokenizer for examples and tests.
+
+    Rules:
+    - lowercase text
+    - keep alphanumeric tokens
+    - remove common stop words
+    - return stable token order
+    """
+
+    if text is None:
+        raise ValueError("text cannot be None.")
+
+    normalized = text.lower()
+    tokens = TOKEN_PATTERN.findall(normalized)
+
+    return [
+        token
+        for token in tokens
+        if token and token not in stop_words
+    ]
+
+
+# =============================================================================
+# Validation helpers
+# =============================================================================
+
+
+def estimate_token_count(text: str) -> int:
+    """
+    Lightweight deterministic token estimator.
+
+    Production systems should use the tokenizer for the target model when
+    strict token limits matter.
+    """
+
+    if not text:
+        return 0
+
+    return max(1, math.ceil(len(text) / 4))
+
+
+def validate_non_empty_string(value: str, field_name: str) -> None:
+    if not value or not value.strip():
+        raise ValueError(f"{field_name} cannot be empty.")
+
+
+def validate_text_chunk(chunk: TextChunk) -> None:
+    validate_non_empty_string(chunk.chunk_id, "chunk_id")
+    validate_non_empty_string(chunk.document_id, "document_id")
+    validate_non_empty_string(chunk.text, f"text for chunk {chunk.chunk_id}")
+
+    if chunk.token_count <= 0:
+        raise ValueError(f"token_count must be positive for chunk {chunk.chunk_id}.")
+
+    if chunk.metadata is None:
+        raise ValueError(f"metadata cannot be None for chunk {chunk.chunk_id}.")
+
+
+def validate_keyword_retrieval_config(config: KeywordRetrievalConfig) -> None:
+    if config.top_k <= 0:
+        raise ValueError("top_k must be greater than zero.")
+
+    if config.max_context_tokens <= 0:
+        raise ValueError("max_context_tokens must be greater than zero.")
+
+    if config.min_score < 0:
+        raise ValueError("min_score cannot be negative.")
+
+    validate_non_empty_string(config.retriever_name, "retriever_name")
+
+
+# =============================================================================
+# Metadata filtering
+# =============================================================================
+
+
+def metadata_matches_filters(
+    metadata: Metadata,
+    filters: Metadata,
+) -> bool:
+    """
+    Exact metadata filter helper.
+
+    Enterprise note:
+    - apply user_id, organization_id, and permission filters before returning
+      results
+    - do not silently ignore permission filters
+    - external search systems should apply filters server-side when possible
+    """
+
+    for key, expected_value in filters.items():
+        actual_value = metadata.get(key)
+
+        if isinstance(expected_value, (list, tuple, set)):
+            if actual_value not in expected_value:
+                return False
+        else:
+            if actual_value != expected_value:
+                return False
+
+    return True
+
+
+# =============================================================================
+# Index building
+# =============================================================================
+
+
+def calculate_term_frequencies(tokens: list[str]) -> dict[str, int]:
+    if not tokens:
+        return {}
+
+    return dict(Counter(tokens))
+
+
+def calculate_normalized_term_frequencies(tokens: list[str]) -> dict[str, float]:
+    if not tokens:
+        return {}
+
+    total_terms = len(tokens)
+    raw_counts = calculate_term_frequencies(tokens)
+
+    return {
+        term: count / total_terms
+        for term, count in raw_counts.items()
+    }
+
+
+def calculate_document_frequencies(
+    entries: list[KeywordIndexEntry],
+) -> dict[str, int]:
+    document_frequencies: dict[str, int] = {}
+
+    for entry in entries:
+        unique_terms = set(entry.terms)
+
+        for term in unique_terms:
+            document_frequencies[term] = document_frequencies.get(term, 0) + 1
+
+    return document_frequencies
+
+
+def calculate_inverse_document_frequencies(
+    *,
+    document_frequencies: dict[str, int],
+    total_documents: int,
+) -> dict[str, float]:
+    """
+    Smooth IDF.
+
+    Formula:
+        idf = log((1 + total_documents) / (1 + document_frequency)) + 1
+
+    Why:
+    - avoids division by zero
+    - prevents zero IDF for common terms
+    - keeps scoring stable for small corpora
+    """
+
+    if total_documents <= 0:
+        raise ValueError("total_documents must be greater than zero.")
+
+    return {
+        term: math.log((1 + total_documents) / (1 + frequency)) + 1.0
+        for term, frequency in document_frequencies.items()
+    }
+
+
+def build_keyword_index(
+    chunks: list[TextChunk],
+    *,
+    indexed_text_type: str = "original",
+    tokenizer_name: str = "simple_regex_lowercase_alphanumeric",
+) -> KeywordIndex:
+    """
+    Build an in-memory keyword index.
+
+    Rules:
+    - validate chunks
+    - preserve original chunk text
+    - preserve metadata
+    - tokenize deterministically
+    - compute normalized term frequencies
+    - compute document frequencies
+    - compute inverse document frequencies
+    """
+
+    if not chunks:
+        raise ValueError("chunks cannot be empty.")
+
+    validate_non_empty_string(indexed_text_type, "indexed_text_type")
+    validate_non_empty_string(tokenizer_name, "tokenizer_name")
+
+    entries: list[KeywordIndexEntry] = []
+
+    for chunk in chunks:
+        validate_text_chunk(chunk)
+
+        terms = tokenize_for_keyword_search(chunk.text)
+
+        entry = KeywordIndexEntry(
+            chunk=chunk,
+            terms=terms,
+            term_frequencies=calculate_term_frequencies(terms),
+            normalized_term_frequencies=calculate_normalized_term_frequencies(terms),
+            metadata={
+                **chunk.metadata,
+                "indexed_text_type": indexed_text_type,
+                "tokenizer_name": tokenizer_name,
+            },
+        )
+
+        entries.append(entry)
+
+    document_frequencies = calculate_document_frequencies(entries)
+
+    inverse_document_frequencies = calculate_inverse_document_frequencies(
+        document_frequencies=document_frequencies,
+        total_documents=len(entries),
+    )
+
+    return KeywordIndex(
+        entries=entries,
+        document_frequencies=document_frequencies,
+        inverse_document_frequencies=inverse_document_frequencies,
+        tokenizer_name=tokenizer_name,
+        indexed_text_type=indexed_text_type,
+    )
+
+
+# =============================================================================
+# Keyword scoring and retrieval
+# =============================================================================
+
+
+def score_entry_with_tfidf(
+    *,
+    query_terms: list[str],
+    entry: KeywordIndexEntry,
+    inverse_document_frequencies: dict[str, float],
+) -> float:
+    """
+    Score one chunk against query terms using normalized TF-IDF.
+
+    Rules:
+    - use unique query terms to avoid repeated query terms exploding the score
+    - use normalized term frequency to avoid long chunks dominating unfairly
+    - use IDF to reduce the impact of corpus-wide common terms
+    """
+
+    if not query_terms:
+        return 0.0
+
+    score = 0.0
+
+    for term in sorted(set(query_terms)):
+        term_frequency = entry.normalized_term_frequencies.get(term, 0.0)
+        inverse_document_frequency = inverse_document_frequencies.get(term, 0.0)
+
+        score += term_frequency * inverse_document_frequency
+
+    return score
+
+
+def keyword_search(
+    *,
+    query: str,
+    index: KeywordIndex,
+    config: KeywordRetrievalConfig,
+) -> list[RetrievalResult]:
+    """
+    Retrieve chunks ranked by TF-IDF keyword relevance.
+
+    Rules:
+    - validate query
+    - validate config
+    - tokenize query deterministically
+    - apply metadata filters
+    - preserve metadata
+    - return structured ranked results
+    - stable tie-break by chunk_id
+    """
+
+    validate_non_empty_string(query, "query")
+    validate_keyword_retrieval_config(config)
+
+    query_terms = tokenize_for_keyword_search(query)
+
+    if not query_terms:
+        return []
+
+    scored_entries: list[tuple[float, KeywordIndexEntry]] = []
+
+    for entry in index.entries:
+        if not metadata_matches_filters(entry.chunk.metadata, config.filters):
+            continue
+
+        score = score_entry_with_tfidf(
+            query_terms=query_terms,
+            entry=entry,
+            inverse_document_frequencies=index.inverse_document_frequencies,
+        )
+
+        if score <= config.min_score:
+            continue
+
+        scored_entries.append((score, entry))
+
+    scored_entries.sort(
+        key=lambda item: (-item[0], item[1].chunk.chunk_id)
+    )
+
+    results: list[RetrievalResult] = []
+
+    for rank, (score, entry) in enumerate(scored_entries[: config.top_k], start=1):
+        chunk = entry.chunk
+
+        results.append(
+            RetrievalResult(
+                chunk_id=chunk.chunk_id,
+                document_id=chunk.document_id,
+                text=chunk.text,
+                token_count=chunk.token_count,
+                metadata={
+                    **chunk.metadata,
+                    "indexed_text_type": index.indexed_text_type,
+                    "tokenizer_name": index.tokenizer_name,
+                },
+                score=score,
+                score_type="tf_idf",
+                rank=rank,
+                retriever_name=config.retriever_name,
+            )
+        )
+
+    return results
+
+
+# =============================================================================
+# Context output
+# =============================================================================
+
+
+def format_result_for_context(
+    *,
+    result: RetrievalResult,
+    include_scores: bool,
+) -> str:
+    document_name = result.metadata.get("document_name", "unknown")
+    page_number = result.metadata.get("page_number")
+    section_heading = result.metadata.get("section_heading")
+
+    header_parts = [
+        f"Source: {document_name}",
+        f"Chunk: {result.chunk_id}",
+    ]
+
+    if page_number is not None:
+        header_parts.append(f"Page: {page_number}")
+
+    if section_heading:
+        header_parts.append(f"Section: {section_heading}")
+
+    if include_scores:
+        header_parts.append(f"{result.score_type}: {result.score:.4f}")
+        header_parts.append(f"Rank: {result.rank}")
+        header_parts.append(f"Retriever: {result.retriever_name}")
+
+    header = f"[{' | '.join(header_parts)}]"
+
+    return f"{header}\n{result.text.strip()}"
+
+
+def build_context_block(
+    *,
+    results: list[RetrievalResult],
+    max_context_tokens: int,
+    include_scores: bool = True,
+) -> tuple[str, list[str]]:
+    """
+    Build a simple token-budget-aware context block.
+
+    This is intentionally small because this file focuses on keyword retrieval.
+    A full enterprise context builder should live in contextbuilding.md.
+    """
+
+    if max_context_tokens <= 0:
+        raise ValueError("max_context_tokens must be greater than zero.")
+
+    blocks: list[str] = []
+    warnings: list[str] = []
+    used_tokens = 0
+    seen_chunk_ids: set[str] = set()
+
+    for result in results:
+        if result.chunk_id in seen_chunk_ids:
+            warnings.append(f"Skipped duplicate chunk: {result.chunk_id}")
+            continue
+
+        block = format_result_for_context(
+            result=result,
+            include_scores=include_scores,
+        )
+
+        block_tokens = estimate_token_count(block)
+
+        if used_tokens + block_tokens > max_context_tokens:
+            warnings.append(
+                f"Skipped chunk {result.chunk_id} because it would exceed max_context_tokens."
+            )
+            continue
+
+        blocks.append(block)
+        seen_chunk_ids.add(result.chunk_id)
+        used_tokens += block_tokens
+
+    if not blocks:
+        warnings.append("No context blocks were included.")
+
+    return "\n\n---\n\n".join(blocks), warnings
+
+
+# =============================================================================
+# Orchestration
+# =============================================================================
+
+
+def retrieve_context_for_query(
+    *,
+    query: str,
+    chunks: list[TextChunk],
+    config: KeywordRetrievalConfig,
+    indexed_text_type: str = "original",
+) -> RetrievalResponse:
+    """
+    End-to-end basic keyword retrieval helper.
+
+    This is the preferred output style for examples:
+    - validate
+    - index
+    - retrieve
+    - build context
+    - return structured response
+    """
+
+    validate_non_empty_string(query, "query")
+    validate_keyword_retrieval_config(config)
+
+    index = build_keyword_index(
+        chunks,
+        indexed_text_type=indexed_text_type,
+    )
+
+    results = keyword_search(
+        query=query,
+        index=index,
+        config=config,
+    )
+
+    context, warnings = build_context_block(
+        results=results,
+        max_context_tokens=config.max_context_tokens,
+        include_scores=config.include_scores_in_context,
+    )
+
+    return RetrievalResponse(
+        query=query,
+        results=results,
+        context=context,
+        result_count=len(results),
+        warnings=warnings,
+        config_used={
+            "top_k": config.top_k,
+            "max_context_tokens": config.max_context_tokens,
+            "filters": config.filters,
+            "retriever_name": config.retriever_name,
+            "indexed_text_type": indexed_text_type,
+            "score_type": "tf_idf",
+            "tokenizer": "simple_regex_lowercase_alphanumeric",
+        },
+    )
+
+
+# =============================================================================
+# Demo data
+# =============================================================================
+
+
+def make_demo_chunks() -> list[TextChunk]:
+    """
+    Demo corpus.
+
+    Metadata intentionally includes user_id and organization_id so the example
+    demonstrates permission-aware filtering.
+    """
+
+    raw_chunks = [
+        {
+            "chunk_id": "q4-report:chunk-001",
+            "document_id": "q4-report",
+            "text": (
+                "Revenue increased by 18% in Q4 as enterprise customers expanded "
+                "their annual contracts and operating margin improved."
+            ),
+            "metadata": {
+                "document_name": "Q4 Financial Report",
+                "page_number": 4,
+                "section_heading": "Financial Performance",
+                "user_id": "user_123",
+                "organization_id": "org_abc",
+                "source_type": "pdf",
+            },
+        },
+        {
+            "chunk_id": "help-center:chunk-001",
+            "document_id": "help-center",
+            "text": (
+                "Users can reset their password from the account security page "
+                "after verifying their email address."
+            ),
+            "metadata": {
+                "document_name": "Help Center Article",
+                "page_number": 1,
+                "section_heading": "Password Reset",
+                "user_id": "user_123",
+                "organization_id": "org_abc",
+                "source_type": "html",
+            },
+        },
+        {
+            "chunk_id": "msa:chunk-001",
+            "document_id": "msa",
+            "text": (
+                "The customer agreement renews annually unless either party sends "
+                "a termination notice before the renewal date."
+            ),
+            "metadata": {
+                "document_name": "Master Services Agreement",
+                "page_number": 9,
+                "section_heading": "Renewal and Termination",
+                "user_id": "user_123",
+                "organization_id": "org_abc",
+                "source_type": "docx",
+            },
+        },
+        {
+            "chunk_id": "infra-plan:chunk-001",
+            "document_id": "infra-plan",
+            "text": (
+                "Database latency decreased after the infrastructure team moved "
+                "read-heavy workloads to dedicated replicas."
+            ),
+            "metadata": {
+                "document_name": "Infrastructure Plan",
+                "page_number": 2,
+                "section_heading": "Database Performance",
+                "user_id": "user_999",
+                "organization_id": "org_other",
+                "source_type": "md",
+            },
+        },
+    ]
+
+    chunks: list[TextChunk] = []
+
+    for item in raw_chunks:
+        text = item["text"]
+
+        chunks.append(
+            TextChunk(
+                chunk_id=item["chunk_id"],
+                document_id=item["document_id"],
+                text=text,
+                token_count=estimate_token_count(text),
+                metadata=item["metadata"],
+            )
+        )
+
+    return chunks
+
+
+# =============================================================================
+# Example run
+# =============================================================================
+
+
+def main() -> None:
+    chunks = make_demo_chunks()
+
+    config = KeywordRetrievalConfig(
+        top_k=3,
+        max_context_tokens=900,
+        filters={
+            "user_id": "user_123",
+            "organization_id": "org_abc",
+        },
+        retriever_name="keyword_tfidf",
+        include_scores_in_context=True,
+        min_score=0.0,
+    )
+
+    response = retrieve_context_for_query(
+        query="financial revenue margin",
+        chunks=chunks,
+        config=config,
+        indexed_text_type="original",
+    )
+
+    print("RETRIEVAL RESPONSE")
+    print("==================")
+    print(
+        json.dumps(
+            {
+                "query": response.query,
+                "result_count": response.result_count,
+                "results": [
+                    {
+                        "rank": result.rank,
+                        "chunk_id": result.chunk_id,
+                        "document_id": result.document_id,
+                        "score": round(result.score, 4),
+                        "score_type": result.score_type,
+                        "retriever_name": result.retriever_name,
+                        "document_name": result.metadata.get("document_name"),
+                    }
+                    for result in response.results
+                ],
+                "warnings": response.warnings,
+                "config_used": response.config_used,
+            },
+            indent=2,
+        )
+    )
+
+    print("\nCONTEXT")
+    print("=======")
+    print(response.context)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+output_path = Path("example_keyword_retrieval.py")
+
+if output_path.exists():
+    raise FileExistsError(
+        "example_keyword_retrieval.py already exists. "
+        "This script will not overwrite it. "
+        "Delete or rename the existing file if you intentionally want to recreate it."
+    )
+
+output_path.write_text(
+    example_keyword_retrieval_py,
+    encoding="utf-8",
+)

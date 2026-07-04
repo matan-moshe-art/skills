@@ -1,0 +1,870 @@
+# Gold Standard Core RAG Reference
+
+This file defines the core contracts, data models, function standards, and orchestration rules for a modular Retrieval-Augmented Generation system.
+
+It is the base reference for all retrieval implementations, including:
+
+* embedding retrieval
+* keyword retrieval
+* hybrid retrieval
+* contextual retrieval preprocessing
+* reranking
+* metadata filtering
+* token-budget-aware context building
+
+This file should not contain provider-specific indexing logic unless the provider is isolated behind a wrapper.
+
+---
+
+## Core Principles
+
+A gold-standard RAG implementation must:
+
+* use small focused functions
+* preserve metadata across all stages
+* keep retrieval strategies modular
+* avoid hardcoded API keys
+* isolate provider-specific logic
+* respect token and context limits
+* return scores and score provenance
+* avoid rewriting unrelated systems
+* avoid unnecessary frameworks
+* support query-time retrieval configuration
+* keep original chunk text separate from contextualized index text
+* make future retrieval strategies easy to add
+
+Do not collapse ingestion, indexing, retrieval, fusion, reranking, and context building into one large function.
+
+---
+
+## Required Pipeline Layers
+
+A production-grade RAG system should be organized into these layers.
+
+1. Ingestion layer
+
+Purpose:
+
+* load documents
+* extract text
+* preserve source metadata
+* validate document input
+
+2. Chunking layer
+
+Purpose:
+
+* split documents into retrieval-safe chunks
+* count or estimate tokens
+* preserve metadata
+* assign stable chunk IDs
+
+3. Optional contextualization layer
+
+Purpose:
+
+* generate short context notes for chunks during ingestion
+* index contextualized text
+* preserve original text for final context output
+
+4. Indexing layer
+
+Purpose:
+
+* build keyword indexes
+* build embedding indexes
+* store chunks, metadata, and retrieval artifacts
+
+5. First-stage retrieval layer
+
+Purpose:
+
+* retrieve candidate chunks using one or more strategies
+
+Examples:
+
+* keyword retrieval
+* embedding retrieval
+* metadata filtering
+* recency filtering
+
+6. Fusion layer
+
+Purpose:
+
+* combine ranked lists from multiple retrievers
+
+Recommended default:
+
+* Reciprocal Rank Fusion
+
+7. Optional reranking layer
+
+Purpose:
+
+* rerank a limited candidate pool after first-stage retrieval and fusion
+
+8. Context-building layer
+
+Purpose:
+
+* build the final context block
+* respect max_context_tokens
+* include source metadata and scores
+
+9. Response layer
+
+Purpose:
+
+* return query, context, results, config used, warnings, and provenance
+
+---
+
+## Data Models
+
+Use explicit data models or equivalent documented contracts.
+
+Python examples are shown for clarity.
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+
+Metadata = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DocumentRecord:
+    document_id: str
+    document_name: str
+    source_type: str
+    text: str
+    metadata: Metadata = field(default_factory=dict)
+    source_uri: str | None = None
+
+
+@dataclass(frozen=True)
+class TextChunk:
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ContextualizedChunk:
+    chunk: TextChunk
+    contextualized_text: str
+    context_summary: str
+    context_model: str
+    metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EmbeddedChunk:
+    chunk: TextChunk
+    embedding: list[float]
+    embedding_model: str
+    metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RetrievalResult:
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata
+    score: float
+    score_type: str
+    rank: int
+    retriever_name: str
+
+
+@dataclass(frozen=True)
+class FusedRetrievalResult:
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata
+    fused_score: float
+    fused_rank: int
+    source_results: list[RetrievalResult]
+    contributing_retrievers: list[str]
+
+
+@dataclass(frozen=True)
+class RerankedResult:
+    chunk_id: str
+    document_id: str
+    text: str
+    token_count: int
+    metadata: Metadata
+    rerank_score: float
+    rerank_rank: int
+    previous_rank: int
+    score_provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RetrievalConfig:
+    strategies: list[str]
+    top_k: int = 5
+    candidate_pool_size: int = 30
+    max_context_tokens: int = 3000
+    use_contextualized_index: bool = False
+    fusion_strategy: Literal["rrf", "none"] = "rrf"
+    rrf_k: int = 60
+    rerank: bool = False
+    filters: Metadata = field(default_factory=dict)
+    include_scores: bool = True
+    include_metadata: bool = True
+
+
+@dataclass(frozen=True)
+class RetrievalResponse:
+    query: str
+    context: str
+    results: list[Any]
+    result_count: int
+    config_used: RetrievalConfig
+    warnings: list[str] = field(default_factory=list)
+```
+
+---
+
+## Token Counting
+
+Token counting must be explicit.
+
+For production systems, use the tokenizer that matches the target model when possible.
+
+For lightweight local examples, an estimator is acceptable.
+
+```python
+import math
+
+
+def estimate_token_count(text: str) -> int:
+    if not text:
+        return 0
+
+    return max(1, math.ceil(len(text) / 4))
+```
+
+Rules:
+
+* Empty text should return zero tokens.
+* Non-empty text should return at least one token.
+* Token estimation should not be used when exact billing or strict model limits matter.
+* The selected counting method should be consistent across chunking and context building.
+
+---
+
+## Document Validation
+
+Documents must be validated before chunking.
+
+```python
+def validate_document(document: DocumentRecord) -> None:
+    if not document.document_id or not document.document_id.strip():
+        raise ValueError("document_id cannot be empty.")
+
+    if not document.document_name or not document.document_name.strip():
+        raise ValueError("document_name cannot be empty.")
+
+    if not document.text or not document.text.strip():
+        raise ValueError("document text cannot be empty.")
+```
+
+Rules:
+
+* Reject empty documents.
+* Do not silently drop documents.
+* Do not remove metadata.
+* Do not overwrite source identifiers.
+
+---
+
+## Chunking Function Contract
+
+Function:
+
+```python
+chunk_text()
+```
+
+Purpose:
+
+Split document text into retrieval-safe chunks.
+
+Inputs:
+
+* document: DocumentRecord
+* max_tokens: int
+* overlap_tokens: int
+* strategy: string
+* metadata: optional metadata
+
+Output:
+
+* list[TextChunk]
+
+Each chunk must include:
+
+* chunk_id
+* document_id
+* text
+* token_count
+* metadata
+
+Rules:
+
+* Reject empty text.
+* Preserve document metadata.
+* Preserve source metadata.
+* Do not silently drop oversized text.
+* Do not exceed max_tokens unless unavoidable.
+* Handle overlap intentionally.
+* Assign stable chunk IDs.
+* Include chunk index in metadata.
+* Include document name in metadata.
+
+---
+
+## Paragraph Chunking Example
+
+```python
+def chunk_text_by_paragraph(
+    document: DocumentRecord,
+    *,
+    max_tokens: int = 500,
+    overlap_tokens: int = 0,
+    extra_metadata: dict[str, Any] | None = None,
+) -> list[TextChunk]:
+    validate_document(document)
+
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be greater than zero.")
+
+    if overlap_tokens < 0:
+        raise ValueError("overlap_tokens cannot be negative.")
+
+    if overlap_tokens >= max_tokens:
+        raise ValueError("overlap_tokens must be smaller than max_tokens.")
+
+    base_metadata = {
+        **document.metadata,
+        **(extra_metadata or {}),
+        "document_name": document.document_name,
+        "source_type": document.source_type,
+        "source_uri": document.source_uri,
+    }
+
+    paragraphs = [p.strip() for p in document.text.split("\n\n") if p.strip()]
+
+    if not paragraphs:
+        raise ValueError("No non-empty paragraphs found.")
+
+    chunks: list[TextChunk] = []
+    current_parts: list[str] = []
+    current_tokens = 0
+    chunk_index = 0
+
+    for paragraph_index, paragraph in enumerate(paragraphs):
+        paragraph_tokens = estimate_token_count(paragraph)
+
+        if current_tokens + paragraph_tokens > max_tokens and current_parts:
+            chunk_text = "\n\n".join(current_parts)
+
+            chunks.append(
+                TextChunk(
+                    chunk_id=f"{document.document_id}:chunk-{chunk_index}",
+                    document_id=document.document_id,
+                    text=chunk_text,
+                    token_count=current_tokens,
+                    metadata={
+                        **base_metadata,
+                        "chunk_index": chunk_index,
+                        "chunking_strategy": "paragraph",
+                    },
+                )
+            )
+
+            chunk_index += 1
+            current_parts = []
+            current_tokens = 0
+
+        current_parts.append(paragraph)
+        current_tokens += paragraph_tokens
+
+    if current_parts:
+        chunk_text = "\n\n".join(current_parts)
+
+        chunks.append(
+            TextChunk(
+                chunk_id=f"{document.document_id}:chunk-{chunk_index}",
+                document_id=document.document_id,
+                text=chunk_text,
+                token_count=current_tokens,
+                metadata={
+                    **base_metadata,
+                    "chunk_index": chunk_index,
+                    "chunking_strategy": "paragraph",
+                },
+            )
+        )
+
+    return chunks
+```
+
+Note:
+
+This example does not implement overlap because paragraph overlap requires careful policy decisions. If overlap is required, define whether overlap is paragraph-based, token-based, or character-based.
+
+---
+
+## Chunk Validation
+
+```python
+def validate_chunks(chunks: list[TextChunk]) -> None:
+    if not chunks:
+        raise ValueError("chunks cannot be empty.")
+
+    seen_chunk_ids: set[str] = set()
+
+    for chunk in chunks:
+        if not chunk.chunk_id or not chunk.chunk_id.strip():
+            raise ValueError("chunk_id cannot be empty.")
+
+        if chunk.chunk_id in seen_chunk_ids:
+            raise ValueError(f"Duplicate chunk_id found: {chunk.chunk_id}")
+
+        if not chunk.document_id or not chunk.document_id.strip():
+            raise ValueError(f"document_id cannot be empty for chunk {chunk.chunk_id}.")
+
+        if not chunk.text or not chunk.text.strip():
+            raise ValueError(f"Chunk text cannot be empty for chunk {chunk.chunk_id}.")
+
+        if chunk.token_count <= 0:
+            raise ValueError(f"token_count must be positive for chunk {chunk.chunk_id}.")
+
+        seen_chunk_ids.add(chunk.chunk_id)
+```
+
+Rules:
+
+* Reject duplicate chunk IDs.
+* Reject empty chunk text.
+* Reject missing document IDs.
+* Reject invalid token counts.
+* Validate before indexing.
+
+---
+
+## Retrieval Result Rules
+
+Every retriever must return a consistent result shape.
+
+A retriever result must include:
+
+* chunk_id
+* document_id
+* text
+* token_count
+* metadata
+* score
+* score_type
+* rank
+* retriever_name
+
+Score examples:
+
+* cosine similarity
+* tf_idf
+* bm25
+* recency_boost
+* metadata_match
+* rerank_score
+* fused_score
+
+Rules:
+
+* Do not hide scores.
+* Do not overwrite scores from other retrievers.
+* Preserve score provenance during fusion and reranking.
+* Deduplicate by chunk_id, not by text.
+* Preserve source metadata.
+
+---
+
+## Context Block Builder
+
+Function:
+
+```python
+build_context_block()
+```
+
+Purpose:
+
+Build the final context string for an LLM without exceeding the token budget.
+
+Inputs:
+
+* results
+* max_context_tokens
+* include_scores
+* include_metadata
+
+Output:
+
+* context string
+
+Rules:
+
+* Respect max_context_tokens.
+* Do not silently exceed the token budget.
+* Skip chunks that do not fit unless truncation is explicitly requested.
+* Preserve source metadata.
+* Include scores when requested.
+* Include document name when available.
+* Include page number when available.
+* Return an empty string safely when no results exist.
+
+```python
+def build_context_block(
+    results: list[RetrievalResult | FusedRetrievalResult | RerankedResult],
+    *,
+    max_context_tokens: int,
+    include_scores: bool = True,
+    include_metadata: bool = True,
+) -> str:
+    if max_context_tokens <= 0:
+        raise ValueError("max_context_tokens must be greater than zero.")
+
+    blocks: list[str] = []
+    used_tokens = 0
+
+    for result in results:
+        token_count = result.token_count
+
+        if used_tokens + token_count > max_context_tokens:
+            continue
+
+        source = result.metadata.get("document_name", "unknown")
+        page = result.metadata.get("page_number")
+        chunk_id = result.chunk_id
+
+        header_parts = [f"Source: {source}", f"Chunk: {chunk_id}"]
+
+        if page is not None:
+            header_parts.append(f"Page: {page}")
+
+        if include_scores:
+            if hasattr(result, "score"):
+                header_parts.append(f"Score: {result.score:.4f}")
+            elif hasattr(result, "fused_score"):
+                header_parts.append(f"Fused Score: {result.fused_score:.4f}")
+            elif hasattr(result, "rerank_score"):
+                header_parts.append(f"Rerank Score: {result.rerank_score:.4f}")
+
+        if include_metadata:
+            tags = result.metadata.get("tags")
+            if tags:
+                header_parts.append(f"Tags: {tags}")
+
+        block = f"[{' | '.join(header_parts)}]\n{result.text}"
+        blocks.append(block)
+
+        used_tokens += token_count
+
+    return "\n\n---\n\n".join(blocks)
+```
+
+---
+
+## Query-Time Retrieval Configuration
+
+Retrieval behavior should be configurable per query when the system supports multiple strategies.
+
+Example:
+
+```python
+config = RetrievalConfig(
+    strategies=["keyword", "embedding"],
+    top_k=5,
+    candidate_pool_size=30,
+    max_context_tokens=3000,
+    use_contextualized_index=True,
+    fusion_strategy="rrf",
+    rerank=True,
+    filters={"user_id": "user_123"},
+)
+```
+
+Rules:
+
+* Do not hardcode one retrieval strategy globally unless the user requests it.
+* Allow simple systems to use a fixed strategy.
+* Allow advanced systems to select strategies per query.
+* Validate the requested strategies before retrieval.
+
+---
+
+## Retrieval Config Validation
+
+```python
+SUPPORTED_STRATEGIES = {
+    "keyword",
+    "embedding",
+    "metadata",
+    "recency",
+}
+
+
+def validate_retrieval_config(config: RetrievalConfig) -> None:
+    if not config.strategies:
+        raise ValueError("At least one retrieval strategy is required.")
+
+    unsupported = set(config.strategies) - SUPPORTED_STRATEGIES
+
+    if unsupported:
+        raise ValueError(f"Unsupported retrieval strategies: {sorted(unsupported)}")
+
+    if config.top_k <= 0:
+        raise ValueError("top_k must be greater than zero.")
+
+    if config.candidate_pool_size < config.top_k:
+        raise ValueError("candidate_pool_size must be greater than or equal to top_k.")
+
+    if config.max_context_tokens <= 0:
+        raise ValueError("max_context_tokens must be greater than zero.")
+
+    if config.fusion_strategy not in {"rrf", "none"}:
+        raise ValueError(f"Unsupported fusion strategy: {config.fusion_strategy}")
+```
+
+---
+
+## End-to-End Retrieval Helper Contract
+
+Function:
+
+```python
+retrieve_context_for_query()
+```
+
+Purpose:
+
+Run the selected query-time retrieval pipeline and return context for an LLM.
+
+Inputs:
+
+* query
+* retrieval config
+* available retrievers
+* optional fusion strategy
+* optional reranker
+* context builder
+
+Output:
+
+* RetrievalResponse
+
+Required behavior:
+
+* validate query
+* validate config
+* run selected retrievers
+* apply metadata filters when requested
+* fuse rankings when multiple retrievers are active
+* optionally rerank candidates
+* take final top_k
+* build final context
+* return context, results, result count, config used, and warnings
+
+Pseudo-contract:
+
+```python
+def retrieve_context_for_query(
+    *,
+    query: str,
+    config: RetrievalConfig,
+    retrievers: dict[str, Any],
+    fusion_fn: Any | None = None,
+    reranker: Any | None = None,
+) -> RetrievalResponse:
+    if not query or not query.strip():
+        raise ValueError("query cannot be empty.")
+
+    validate_retrieval_config(config)
+
+    # 1. Run selected first-stage retrievers.
+    # 2. Apply fusion if needed.
+    # 3. Apply optional reranking if configured.
+    # 4. Keep final top_k.
+    # 5. Build context block.
+    # 6. Return RetrievalResponse.
+
+    raise NotImplementedError("Implement orchestration according to selected retrievers.")
+```
+
+---
+
+## Error Handling Rules
+
+A gold-standard implementation must raise clear errors for:
+
+* empty query
+* empty document text
+* invalid max_tokens
+* invalid max_context_tokens
+* duplicate chunk IDs
+* unsupported retrieval strategy
+* missing embedding API key
+* embedding dimension mismatch
+* missing selected retriever
+* invalid fusion strategy
+* reranking requested without reranker
+* storage backend unavailable
+
+Do not fail silently.
+
+---
+
+## Metadata Rules
+
+Metadata must be preserved through:
+
+* document loading
+* text extraction
+* chunking
+* contextualization
+* indexing
+* retrieval
+* fusion
+* reranking
+* context building
+* final response
+
+Recommended metadata fields:
+
+* document_id
+* document_name
+* source_type
+* source_uri
+* page_number
+* paragraph_number
+* section_heading
+* chunk_index
+* upload_date
+* timestamp
+* user_id
+* organization_id
+* tags
+* permissions
+
+Do not ignore permissions metadata if the retrieval system is user-scoped or organization-scoped.
+
+---
+
+## Security Rules
+
+Never:
+
+* hardcode API keys
+* print API keys
+* commit secrets to examples
+* expose environment variables in logs
+* retrieve documents across users without permission filtering
+* overwrite user files without explicit instruction
+* delete files without explicit instruction and rollback strategy
+* use paid APIs without user approval
+
+Use environment variables for secrets.
+
+---
+
+## Framework Rules
+
+Do not use these unless the user explicitly requests them:
+
+* LangChain
+* LlamaIndex
+* unnecessary web frameworks
+* unnecessary vector databases
+* unnecessary background workers
+
+Keep examples dependency-light unless a specific production backend is selected.
+
+---
+
+## Quality Checklist
+
+Before accepting a RAG implementation as gold standard, verify:
+
+* documents are validated
+* chunks are non-empty
+* chunk IDs are stable
+* metadata is preserved
+* token limits are enforced
+* retrieval returns ranked results
+* scores are included
+* score provenance is preserved
+* context builder respects max_context_tokens
+* API keys are not hardcoded
+* provider logic is isolated
+* retrieval strategies are modular
+* query-time configuration is supported where required
+* tests cover edge cases
+
+---
+
+## Bad vs Good
+
+Bad:
+
+```python
+def rag(query):
+    pass
+```
+
+Bad:
+
+```python
+def search_everything(query, docs):
+    # chunks, embeds, searches, reranks, and builds context all in one place
+    pass
+```
+
+Good:
+
+```python
+load_documents()
+extract_text()
+chunk_text()
+validate_chunks()
+build_keyword_index()
+embed_chunks()
+keyword_search()
+embedding_search()
+fuse_rankings()
+rerank_results()
+build_context_block()
+retrieve_context_for_query()
+```
+
+Each function should have:
+
+* clear inputs
+* clear outputs
+* clear errors
+* metadata preservation
+* token handling
+* testable behavior
